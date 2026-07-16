@@ -1,0 +1,15 @@
+#include "web_assets.h"
+
+namespace logit_scope::web_assets {
+namespace {
+
+const unsigned char index_html_data[] = { @LOGIT_SCOPE_INDEX_HTML@ };
+const unsigned char app_js_data[] = { @LOGIT_SCOPE_APP_JS@ };
+const unsigned char style_css_data[] = { @LOGIT_SCOPE_STYLE_CSS@ };
+
+}
+std::string_view index_html{ reinterpret_cast<const char*>(index_html_data), sizeof(index_html_data) };
+std::string_view app_js{ reinterpret_cast<const char*>(app_js_data), sizeof(app_js_data) };
+std::string_view style_css{ reinterpret_cast<const char*>(style_css_data), sizeof(style_css_data) };
+
+}

@@ -1,0 +1,169 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-cpu-release",
+      "displayName": "Windows CPU Release (Visual Studio 2022)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/windows-cpu-release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "GGML_NATIVE": "ON",
+        "GGML_CCACHE": "OFF"
+      }
+    },
+    {
+      "name": "unix-cpu-release",
+      "displayName": "macOS/Linux CPU Release (Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/unix-cpu-release",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GGML_NATIVE": "ON",
+        "GGML_CCACHE": "OFF"
+      }
+    },
+    {
+      "name": "windows-vulkan-release",
+      "displayName": "Windows Vulkan Release (Visual Studio 2022)",
+      "inherits": "windows-cpu-release",
+      "binaryDir": "${sourceDir}/build/windows-vulkan-release",
+      "cacheVariables": {
+        "GGML_VULKAN": "ON"
+      }
+    },
+    {
+      "name": "unix-vulkan-release",
+      "displayName": "macOS/Linux Vulkan Release (Ninja)",
+      "inherits": "unix-cpu-release",
+      "binaryDir": "${sourceDir}/build/unix-vulkan-release",
+      "cacheVariables": {
+        "GGML_VULKAN": "ON"
+      }
+    },
+    {
+      "name": "windows-cuda-release",
+      "displayName": "Windows CUDA Release (Visual Studio 2022)",
+      "inherits": "windows-cpu-release",
+      "binaryDir": "${sourceDir}/build/windows-cuda-release",
+      "cacheVariables": {
+        "GGML_CUDA": "ON"
+      }
+    },
+    {
+      "name": "unix-cuda-release",
+      "displayName": "Linux CUDA Release (Ninja)",
+      "inherits": "unix-cpu-release",
+      "binaryDir": "${sourceDir}/build/unix-cuda-release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "GGML_CUDA": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-cpu-release",
+      "configurePreset": "windows-cpu-release",
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "unix-cpu-release",
+      "configurePreset": "unix-cpu-release",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-vulkan-release",
+      "configurePreset": "windows-vulkan-release",
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "unix-vulkan-release",
+      "configurePreset": "unix-vulkan-release",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-cuda-release",
+      "configurePreset": "windows-cuda-release",
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "unix-cuda-release",
+      "configurePreset": "unix-cuda-release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-cpu-release",
+      "configurePreset": "windows-cpu-release",
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "unix-cpu-release",
+      "configurePreset": "unix-cpu-release",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

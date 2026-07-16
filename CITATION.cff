@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use Logit Scope, please cite it using these metadata."
+title: "Logit Scope"
+type: software
+version: 0.1.0
+authors:
+  - name: "Aaron (caustik)"
+license: Apache-2.0
+repository-code: "https://github.com/caustik/logit-scope"
+abstract: "A local interactive laboratory for reshaping an LLM's next-token probability distribution by candidate rank."
