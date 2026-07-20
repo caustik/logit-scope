@@ -18,10 +18,10 @@ enum class RankProfile
 
 struct ShapeSettings
 {
-    RankProfile profile = RankProfile::exponential;
-    float blend = 0.0f;
-    float concentration = 1.0f;
-    std::size_t candidate_count = 32;
+    RankProfile profile = RankProfile::power;
+    float blend = 1.0f;
+    float concentration = 2.8f;
+    std::size_t candidate_count = 4096;
     std::uint32_t seed = 1234;
     bool protect_control_tokens = true;
 };

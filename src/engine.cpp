@@ -110,11 +110,7 @@ std::string token_to_piece(const llama_vocab* vocab, llama_token token)
 class Engine::Impl
 {
   public:
-    explicit Impl(EngineConfig config) : config_(std::move(config))
-    {
-        settings_candidate_count_.store(32);
-        settings_seed_.store(1234);
-    }
+    explicit Impl(EngineConfig config) : config_(std::move(config)) {}
 
     ~Impl() { stop(); }
 
@@ -735,12 +731,12 @@ class Engine::Impl
     }
 
     EngineConfig config_;
-    std::atomic<int> settings_profile_{static_cast<int>(RankProfile::exponential)};
-    std::atomic<float> settings_blend_{0.0f};
-    std::atomic<float> settings_concentration_{1.0f};
-    std::atomic<std::size_t> settings_candidate_count_{32};
-    std::atomic<std::uint32_t> settings_seed_{1234};
-    std::atomic<bool> settings_protect_control_{true};
+    std::atomic<int> settings_profile_{static_cast<int>(ShapeSettings{}.profile)};
+    std::atomic<float> settings_blend_{ShapeSettings{}.blend};
+    std::atomic<float> settings_concentration_{ShapeSettings{}.concentration};
+    std::atomic<std::size_t> settings_candidate_count_{ShapeSettings{}.candidate_count};
+    std::atomic<std::uint32_t> settings_seed_{ShapeSettings{}.seed};
+    std::atomic<bool> settings_protect_control_{ShapeSettings{}.protect_control_tokens};
 
     std::atomic<bool> started_{false};
     std::atomic<bool> stop_requested_{false};

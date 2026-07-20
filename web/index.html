@@ -22,27 +22,27 @@
         <span>Profile</span>
         <select id="profile">
           <option value="uniform">Uniform</option>
-          <option value="exponential" selected>Exponential</option>
-          <option value="power">Power</option>
+          <option value="exponential">Exponential</option>
+          <option value="power" selected>Power</option>
           <option value="half-normal">Half-normal</option>
         </select>
       </label>
 
       <label class="slider-control">
-        <span>Blend <output id="blendValue">0%</output></span>
-        <input id="blend" type="range" min="0" max="1" step="0.01" value="0" aria-label="Blend">
+        <span>Blend <output id="blendValue">100%</output></span>
+        <input id="blend" type="range" min="0" max="1" step="0.01" value="1" aria-label="Blend">
       </label>
 
       <label class="slider-control">
-        <span>Concentration <output id="concentrationValue">1.00</output></span>
-        <input id="concentration" type="range" min="0.05" max="4" step="0.05" value="1" aria-label="Concentration">
+        <span>Concentration <output id="concentrationValue">2.80</output></span>
+        <input id="concentration" type="range" min="0.05" max="4" step="0.05" value="2.8" aria-label="Concentration">
       </label>
 
       <label>
         <span>Pool</span>
         <select id="candidateCount">
           <option>32</option><option>64</option><option>128</option><option>256</option>
-          <option>512</option><option>1024</option><option>2048</option><option>4096</option>
+          <option>512</option><option>1024</option><option>2048</option><option selected>4096</option>
         </select>
       </label>
 
