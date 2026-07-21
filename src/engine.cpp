@@ -172,8 +172,7 @@ class Engine::Impl
     {
         ShapeSettings settings;
         settings.profile = static_cast<RankProfile>(settings_profile_.load());
-        settings.blend = settings_blend_.load();
-        settings.concentration = settings_concentration_.load();
+        settings.diversity = settings_diversity_.load();
         settings.candidate_count = settings_candidate_count_.load();
         settings.seed = settings_seed_.load();
         settings.protect_control_tokens = settings_protect_control_.load();
@@ -182,10 +181,10 @@ class Engine::Impl
 
     void set_shape_settings(const ShapeSettings& settings)
     {
+        const auto candidate_count = std::max<std::size_t>(2, std::min<std::size_t>(4096, settings.candidate_count));
         settings_profile_.store(static_cast<int>(settings.profile));
-        settings_blend_.store(std::max(0.0f, std::min(1.0f, settings.blend)));
-        settings_concentration_.store(std::max(0.05f, std::min(4.0f, settings.concentration)));
-        settings_candidate_count_.store(std::max<std::size_t>(2, std::min<std::size_t>(4096, settings.candidate_count)));
+        settings_diversity_.store(std::max(0.0f, std::min(2.0f, settings.diversity)));
+        settings_candidate_count_.store(candidate_count);
         settings_seed_.store(settings.seed);
         settings_protect_control_.store(settings.protect_control_tokens);
     }
@@ -196,10 +195,70 @@ class Engine::Impl
         return snapshot_;
     }
 
+    SamplingSnapshot preview_snapshot(const ShapeSettings& settings) const
+    {
+        const std::lock_guard lock(preview_mutex_);
+        if (preview_valid_ && settings.profile == preview_settings_.profile && settings.diversity == preview_settings_.diversity &&
+            settings.candidate_count == preview_settings_.candidate_count)
+            return preview_snapshot_;
+
+        SamplingSnapshot preview;
+        preview.candidate_count = std::max<std::size_t>(2, std::min<std::size_t>(4096, settings.candidate_count));
+
+        std::vector<float> raw_logits(preview.candidate_count);
+        for (std::size_t rank = 0; rank < raw_logits.size(); ++rank)
+            raw_logits[rank] = static_cast<float>(-1.2 * std::log(static_cast<double>(rank) + 1.0));
+        auto shaped_logits = raw_logits;
+        shape_ranked_logits(shaped_logits, settings);
+
+        ProbabilityMetrics raw_metrics;
+        ProbabilityMetrics shaped_metrics;
+        const auto raw_probabilities = probabilities_from_logits(raw_logits, &raw_metrics);
+        const auto shaped_probabilities = probabilities_from_logits(shaped_logits, &shaped_metrics);
+        preview.probability_count = std::min(display_rank_count, preview.candidate_count);
+        auto previous_rank = std::size_t{};
+        for (std::size_t display_index = 0; display_index < preview.probability_count; ++display_index)
+        {
+            const auto rank = display_rank_at(display_index, preview.probability_count, preview.candidate_count, previous_rank);
+            preview.probability_ranks[display_index] = rank;
+            preview.raw_probabilities[display_index] = raw_probabilities[rank];
+            preview.shaped_probabilities[display_index] = shaped_probabilities[rank];
+            previous_rank = rank;
+        }
+        preview.raw_entropy = raw_metrics.entropy;
+        preview.shaped_entropy = shaped_metrics.entropy;
+        preview.raw_peak_probability = raw_metrics.peak_probability;
+        preview.shaped_peak_probability = shaped_metrics.peak_probability;
+        preview.pool_probability_mass = 1.0f;
+        preview.jensen_shannon_divergence = jensen_shannon_divergence(raw_probabilities, shaped_probabilities);
+        preview_snapshot_ = preview;
+        preview_settings_ = settings;
+        preview_valid_ = true;
+        return preview_snapshot_;
+    }
+
   private:
     struct SamplerContext
     {
         Impl* engine = nullptr;
+    };
+
+    struct PendingSamplingData
+    {
+        bool valid = false;
+        std::string selected_token;
+        ShapeSettings settings;
+        std::size_t candidate_count = 0;
+        std::size_t probability_count = 0;
+        std::array<std::size_t, display_rank_count> probability_ranks{};
+        std::array<float, display_rank_count> raw_probabilities{};
+        std::array<float, display_rank_count> shaped_probabilities{};
+        float raw_entropy = 0.0f;
+        float shaped_entropy = 0.0f;
+        float raw_peak_probability = 0.0f;
+        float shaped_peak_probability = 0.0f;
+        float pool_probability_mass = 0.0f;
+        float jensen_shannon_divergence = 0.0f;
     };
 
     void run()
@@ -218,6 +277,8 @@ class Engine::Impl
                 if (reset_requested_.exchange(false))
                 {
                     pending_messages_.clear();
+                    pending_sampling_ = {};
+                    representative_sampling_ = {};
                     messages_.clear();
                     current_response_.clear();
                     previous_formatted_length_ = 0;
@@ -380,14 +441,17 @@ class Engine::Impl
         llama_sampler_chain_add(sampler_, llama_sampler_init_dist(shape_settings().seed));
 
         current_response_.clear();
+        representative_sampling_ = {};
         update_snapshot(
             [](SamplingSnapshot& snapshot)
             {
                 snapshot.generating = true;
                 snapshot.status = "Generating...";
                 snapshot.sampling_step = 0;
+                snapshot.representative_sampling = false;
                 snapshot.selected_token.clear();
             });
+        pending_sampling_ = {};
         publish_transcript(true);
 
         auto batch = llama_batch_get_one(prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()));
@@ -427,15 +491,16 @@ class Engine::Impl
             next_token = llama_sampler_sample(sampler_, context_, -1);
             if (llama_vocab_is_eog(vocab_, next_token))
             {
+                pending_sampling_ = {};
                 reached_eog = true;
                 break;
             }
 
+            commit_sampling_snapshot(next_token);
+
             const auto piece = token_to_piece(vocab_, next_token);
             current_response_ += piece;
             ++generated_token_count;
-            update_snapshot([this, next_token](SamplingSnapshot& snapshot)
-                            { snapshot.selected_token = sanitize_utf8(token_to_piece(vocab_, next_token)); });
             publish_transcript(true);
 
             batch = llama_batch_get_one(&next_token, 1);
@@ -486,6 +551,7 @@ class Engine::Impl
         }
 
         publish_transcript(false);
+        publish_representative_sampling();
         publish_status(completion_status, false);
     }
 
@@ -541,6 +607,19 @@ class Engine::Impl
 
         auto batch = llama_batch_get_one(tokens.data(), static_cast<int32_t>(tokens.size()));
         return llama_decode(context_, batch) == 0;
+    }
+
+    static std::size_t display_rank_at(std::size_t display_index, std::size_t display_count, std::size_t candidate_count,
+                                       std::size_t previous_rank)
+    {
+        if (candidate_count <= display_count) return display_index;
+
+        const auto fraction = static_cast<double>(display_index) / static_cast<double>(display_count - 1);
+        const auto logarithmic_rank =
+            static_cast<std::size_t>(std::llround(std::expm1(fraction * std::log(static_cast<double>(candidate_count)))));
+        const auto minimum_rank = display_index == 0 ? 0 : previous_rank + 1;
+        const auto maximum_rank = candidate_count - (display_count - display_index);
+        return std::max(minimum_rank, std::min(maximum_rank, logarithmic_rank));
     }
 
     void apply_shaping(llama_token_data_array* candidates)
@@ -613,7 +692,6 @@ class Engine::Impl
         ProbabilityMetrics shaped_metrics;
         const auto raw_probabilities = probabilities_from_logits(raw_logits, &raw_metrics);
         const auto shaped_probabilities = probabilities_from_logits(shaped_logits, &shaped_metrics);
-        const auto target_probabilities = target_rank_probabilities(shape_count, settings);
 
         double total_weight = 0.0;
         for (std::size_t index = 0; index < candidates->size; ++index)
@@ -624,33 +702,77 @@ class Engine::Impl
         double selected_weight = 0.0;
         for (const auto logit : raw_logits) selected_weight += std::exp(static_cast<double>(logit - maximum_logit));
 
-        update_snapshot(
-            [&](SamplingSnapshot& snapshot)
-            {
-                ++snapshot.sampling_step;
-                snapshot.candidate_count = shape_count;
-                snapshot.probability_count = std::min(display_rank_count, shape_count);
-                snapshot.raw_probabilities.fill(0.0f);
-                snapshot.target_probabilities.fill(0.0f);
-                snapshot.shaped_probabilities.fill(0.0f);
-                for (std::size_t rank = 0; rank < snapshot.probability_count; ++rank)
-                {
-                    snapshot.raw_probabilities[rank] = raw_probabilities[rank];
-                    snapshot.target_probabilities[rank] = target_probabilities[rank];
-                    snapshot.shaped_probabilities[rank] = shaped_probabilities[rank];
-                }
-                snapshot.raw_entropy = raw_metrics.entropy;
-                snapshot.shaped_entropy = shaped_metrics.entropy;
-                snapshot.raw_peak_probability = raw_metrics.peak_probability;
-                snapshot.shaped_peak_probability = shaped_metrics.peak_probability;
-                snapshot.pool_probability_mass = total_weight > 0.0 ? static_cast<float>(selected_weight / total_weight) : 0.0f;
-                snapshot.jensen_shannon_divergence = jensen_shannon_divergence(raw_probabilities, shaped_probabilities);
-            });
+        pending_sampling_ = {};
+        pending_sampling_.valid = true;
+        pending_sampling_.settings = settings;
+        pending_sampling_.candidate_count = shape_count;
+        pending_sampling_.probability_count = std::min(display_rank_count, shape_count);
+        auto previous_rank = std::size_t{};
+        for (std::size_t display_index = 0; display_index < pending_sampling_.probability_count; ++display_index)
+        {
+            const auto rank = display_rank_at(display_index, pending_sampling_.probability_count, shape_count, previous_rank);
+            pending_sampling_.probability_ranks[display_index] = rank;
+            pending_sampling_.raw_probabilities[display_index] = raw_probabilities[rank];
+            pending_sampling_.shaped_probabilities[display_index] = shaped_probabilities[rank];
+            previous_rank = rank;
+        }
+        pending_sampling_.raw_entropy = raw_metrics.entropy;
+        pending_sampling_.shaped_entropy = shaped_metrics.entropy;
+        pending_sampling_.raw_peak_probability = raw_metrics.peak_probability;
+        pending_sampling_.shaped_peak_probability = shaped_metrics.peak_probability;
+        pending_sampling_.pool_probability_mass = total_weight > 0.0 ? static_cast<float>(selected_weight / total_weight) : 0.0f;
+        pending_sampling_.jensen_shannon_divergence = jensen_shannon_divergence(raw_probabilities, shaped_probabilities);
 
         std::copy(selected_candidates.begin(), selected_candidates.end(), candidates->data);
         candidates->size = shape_count;
         candidates->selected = -1;
         candidates->sorted = true;
+    }
+
+    void commit_sampling_snapshot(llama_token selected_token)
+    {
+        if (!pending_sampling_.valid) return;
+
+        pending_sampling_.selected_token = sanitize_utf8(token_to_piece(vocab_, selected_token));
+        const auto settings_match =
+            representative_sampling_.valid && pending_sampling_.settings.profile == representative_sampling_.settings.profile &&
+            pending_sampling_.settings.diversity == representative_sampling_.settings.diversity &&
+            pending_sampling_.settings.candidate_count == representative_sampling_.settings.candidate_count &&
+            pending_sampling_.settings.seed == representative_sampling_.settings.seed &&
+            pending_sampling_.settings.protect_control_tokens == representative_sampling_.settings.protect_control_tokens;
+        if (!settings_match || pending_sampling_.raw_entropy > representative_sampling_.raw_entropy)
+            representative_sampling_ = pending_sampling_;
+
+        const std::lock_guard lock(snapshot_mutex_);
+        ++snapshot_.sampling_step;
+        snapshot_.representative_sampling = false;
+        copy_sampling_data(pending_sampling_, snapshot_);
+        pending_sampling_ = {};
+    }
+
+    static void copy_sampling_data(const PendingSamplingData& source, SamplingSnapshot& destination)
+    {
+        destination.selected_token = source.selected_token;
+        destination.candidate_count = source.candidate_count;
+        destination.probability_count = source.probability_count;
+        destination.probability_ranks = source.probability_ranks;
+        destination.raw_probabilities = source.raw_probabilities;
+        destination.shaped_probabilities = source.shaped_probabilities;
+        destination.raw_entropy = source.raw_entropy;
+        destination.shaped_entropy = source.shaped_entropy;
+        destination.raw_peak_probability = source.raw_peak_probability;
+        destination.shaped_peak_probability = source.shaped_peak_probability;
+        destination.pool_probability_mass = source.pool_probability_mass;
+        destination.jensen_shannon_divergence = source.jensen_shannon_divergence;
+    }
+
+    void publish_representative_sampling()
+    {
+        if (!representative_sampling_.valid) return;
+
+        const std::lock_guard lock(snapshot_mutex_);
+        snapshot_.representative_sampling = true;
+        copy_sampling_data(representative_sampling_, snapshot_);
     }
 
     void publish_transcript(bool generating)
@@ -732,8 +854,7 @@ class Engine::Impl
 
     EngineConfig config_;
     std::atomic<int> settings_profile_{static_cast<int>(ShapeSettings{}.profile)};
-    std::atomic<float> settings_blend_{ShapeSettings{}.blend};
-    std::atomic<float> settings_concentration_{ShapeSettings{}.concentration};
+    std::atomic<float> settings_diversity_{ShapeSettings{}.diversity};
     std::atomic<std::size_t> settings_candidate_count_{ShapeSettings{}.candidate_count};
     std::atomic<std::uint32_t> settings_seed_{ShapeSettings{}.seed};
     std::atomic<bool> settings_protect_control_{ShapeSettings{}.protect_control_tokens};
@@ -750,6 +871,12 @@ class Engine::Impl
 
     mutable std::mutex snapshot_mutex_;
     SamplingSnapshot snapshot_;
+    mutable std::mutex preview_mutex_;
+    mutable SamplingSnapshot preview_snapshot_;
+    mutable ShapeSettings preview_settings_;
+    mutable bool preview_valid_ = false;
+    PendingSamplingData pending_sampling_;
+    PendingSamplingData representative_sampling_;
 
     std::vector<ChatMessage> messages_;
     std::string current_response_;
@@ -781,5 +908,7 @@ ShapeSettings Engine::shape_settings() const { return impl_->shape_settings(); }
 void Engine::set_shape_settings(const ShapeSettings& settings) { impl_->set_shape_settings(settings); }
 
 SamplingSnapshot Engine::snapshot() const { return impl_->snapshot(); }
+
+SamplingSnapshot Engine::preview_snapshot(const ShapeSettings& settings) const { return impl_->preview_snapshot(settings); }
 
 } // namespace logit_scope

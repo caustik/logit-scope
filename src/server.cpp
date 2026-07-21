@@ -18,7 +18,31 @@ namespace
 
 using json = nlohmann::json;
 
-json snapshot_to_json(const SamplingSnapshot& snapshot, const ShapeSettings& settings)
+void append_sampling_data(json& result, const SamplingSnapshot& snapshot)
+{
+    result["candidateCount"] = snapshot.candidate_count;
+    result["rawEntropy"] = snapshot.raw_entropy;
+    result["shapedEntropy"] = snapshot.shaped_entropy;
+    result["rawPeakProbability"] = snapshot.raw_peak_probability;
+    result["shapedPeakProbability"] = snapshot.shaped_peak_probability;
+    result["poolProbabilityMass"] = snapshot.pool_probability_mass;
+    result["jensenShannonDivergence"] = snapshot.jensen_shannon_divergence;
+
+    auto& ranks = result["probabilityRanks"];
+    auto& raw = result["rawProbabilities"];
+    auto& shaped = result["shapedProbabilities"];
+    ranks = json::array();
+    raw = json::array();
+    shaped = json::array();
+    for (std::size_t index = 0; index < snapshot.probability_count; ++index)
+    {
+        ranks.push_back(snapshot.probability_ranks[index]);
+        raw.push_back(snapshot.raw_probabilities[index]);
+        shaped.push_back(snapshot.shaped_probabilities[index]);
+    }
+}
+
+json snapshot_to_json(const SamplingSnapshot& snapshot, const SamplingSnapshot& preview, const ShapeSettings& settings)
 {
     json result = {
         {"modelLoaded", snapshot.model_loaded},
@@ -27,36 +51,19 @@ json snapshot_to_json(const SamplingSnapshot& snapshot, const ShapeSettings& set
         {"transcript", snapshot.transcript},
         {"selectedToken", snapshot.selected_token},
         {"samplingStep", snapshot.sampling_step},
-        {"candidateCount", snapshot.candidate_count},
-        {"rawEntropy", snapshot.raw_entropy},
-        {"shapedEntropy", snapshot.shaped_entropy},
-        {"rawPeakProbability", snapshot.raw_peak_probability},
-        {"shapedPeakProbability", snapshot.shaped_peak_probability},
-        {"poolProbabilityMass", snapshot.pool_probability_mass},
-        {"jensenShannonDivergence", snapshot.jensen_shannon_divergence},
+        {"representativeSampling", snapshot.representative_sampling},
         {"settings",
          {
              {"profile", rank_profile_name(settings.profile)},
-             {"blend", settings.blend},
-             {"concentration", settings.concentration},
+             {"diversity", settings.diversity},
              {"candidateCount", settings.candidate_count},
              {"seed", settings.seed},
              {"protectControlTokens", settings.protect_control_tokens},
          }},
     };
-
-    auto& raw = result["rawProbabilities"];
-    auto& target = result["targetProbabilities"];
-    auto& shaped = result["shapedProbabilities"];
-    raw = json::array();
-    target = json::array();
-    shaped = json::array();
-    for (std::size_t index = 0; index < snapshot.probability_count; ++index)
-    {
-        raw.push_back(snapshot.raw_probabilities[index]);
-        target.push_back(snapshot.target_probabilities[index]);
-        shaped.push_back(snapshot.shaped_probabilities[index]);
-    }
+    append_sampling_data(result, snapshot);
+    result["preview"] = json::object();
+    append_sampling_data(result["preview"], preview);
     return result;
 }
 
@@ -83,8 +90,12 @@ class Server::Impl
         server_.Get("/style.css", [](const httplib::Request&, httplib::Response& response)
                     { response.set_content(std::string(web_assets::style_css), "text/css; charset=utf-8"); });
 
-        server_.Get("/api/snapshot", [this](const httplib::Request&, httplib::Response& response)
-                    { send_json(response, snapshot_to_json(engine_.snapshot(), engine_.shape_settings())); });
+        server_.Get("/api/snapshot",
+                    [this](const httplib::Request&, httplib::Response& response)
+                    {
+                        const auto settings = engine_.shape_settings();
+                        send_json(response, snapshot_to_json(engine_.snapshot(), engine_.preview_snapshot(settings), settings));
+                    });
 
         server_.Post("/api/message",
                      [this](const httplib::Request& request, httplib::Response& response)
@@ -128,8 +139,7 @@ class Server::Impl
                                  }
                                  settings.profile = profile;
                              }
-                             if (input.contains("blend")) settings.blend = input.at("blend").get<float>();
-                             if (input.contains("concentration")) settings.concentration = input.at("concentration").get<float>();
+                             if (input.contains("diversity")) settings.diversity = input.at("diversity").get<float>();
                              if (input.contains("candidateCount")) settings.candidate_count = input.at("candidateCount").get<std::size_t>();
                              if (input.contains("seed")) settings.seed = input.at("seed").get<std::uint32_t>();
                              if (input.contains("protectControlTokens"))

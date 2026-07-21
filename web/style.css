@@ -60,7 +60,7 @@ h2 { font-size: 15px; font-weight: 650; }
 
 .controls {
   display: grid;
-  grid-template-columns: 150px minmax(190px, 1fr) minmax(220px, 1.2fr) 90px 130px auto;
+  grid-template-columns: 150px minmax(260px, 1fr) 90px 130px auto;
   gap: 14px;
   align-items: end;
   padding: 13px 15px;
@@ -70,6 +70,10 @@ h2 { font-size: 15px; font-weight: 650; }
 label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
 label > span { display: flex; justify-content: space-between; gap: 8px; }
 output { color: var(--text); font-variant-numeric: tabular-nums; }
+.controls > label { min-width: 0; }
+.range-scale { color: var(--muted); font-size: 10px; }
+.range-scale span:nth-child(2) { text-align: center; }
+.range-scale span:last-child { text-align: right; }
 
 select, input[type="number"], textarea {
   color: var(--text);
@@ -79,7 +83,7 @@ select, input[type="number"], textarea {
   outline: none;
 }
 
-select, input[type="number"] { height: 34px; padding: 0 9px; }
+select, input[type="number"] { width: 100%; min-width: 0; height: 34px; padding: 0 9px; }
 textarea { width: 100%; min-height: 76px; padding: 10px 11px; resize: vertical; line-height: 1.45; }
 select:focus, input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(69, 179, 216, 0.14); }
 
@@ -139,14 +143,14 @@ footer { display: flex; justify-content: space-between; gap: 16px; min-height: 2
 }
 
 @media (max-width: 680px) {
-  .app-shell { width: min(100% - 16px, 1180px); padding-top: 12px; }
+  .app-shell { width: calc(100% - 16px); max-width: 1180px; padding-top: 12px; }
   .title-row { align-items: start; }
   .title-row p { display: none; }
-  .controls { grid-template-columns: 1fr 1fr; }
+  .controls { grid-template-columns: minmax(0, 1fr); }
   .scope-heading { display: block; }
   .legend { margin-top: 10px; }
   #plot { height: 240px; }
-  .metrics { grid-template-columns: 1fr 1fr; }
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metrics .token { grid-column: 1 / -1; }
   .composer { grid-template-columns: 1fr; }
   .actions { grid-template-columns: repeat(3, 1fr); height: 46px; }

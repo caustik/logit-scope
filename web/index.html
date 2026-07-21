@@ -19,9 +19,9 @@
 
     <section class="controls panel" aria-label="Sampling controls">
       <label>
-        <span>Profile</span>
+        <span>Rank profile</span>
         <select id="profile">
-          <option value="uniform">Uniform</option>
+          <option value="none">None</option>
           <option value="exponential">Exponential</option>
           <option value="power" selected>Power</option>
           <option value="half-normal">Half-normal</option>
@@ -29,13 +29,9 @@
       </label>
 
       <label class="slider-control">
-        <span>Blend <output id="blendValue">100%</output></span>
-        <input id="blend" type="range" min="0" max="1" step="0.01" value="1" aria-label="Blend">
-      </label>
-
-      <label class="slider-control">
-        <span>Concentration <output id="concentrationValue">2.80</output></span>
-        <input id="concentration" type="range" min="0.05" max="4" step="0.05" value="2.8" aria-label="Concentration">
+        <span>Diversity <output id="diversityValue">100% · raw</output></span>
+        <input id="diversity" type="range" min="0" max="200" step="1" value="100" aria-label="Diversity from deterministic through raw to uniform sampling">
+        <span class="range-scale" aria-hidden="true"><span>Deterministic</span><span>Raw</span><span>Uniform</span></span>
       </label>
 
       <label>
@@ -61,21 +57,20 @@
       <div class="scope-heading">
         <div>
           <h2>Sampling probability by candidate rank</h2>
-          <p id="scopeCaption">Persistent target profile</p>
+          <p id="scopeCaption">Per-rank probability · log-rank axis · generate to inspect</p>
         </div>
         <div class="legend" aria-label="Plot legend">
-          <span class="target">Target</span>
           <span class="raw">Raw</span>
-          <span class="shaped">Shaped</span>
+          <span id="shapedLegend" class="shaped">Shaped</span>
         </div>
       </div>
-      <canvas id="plot" aria-label="Rank probability plot"></canvas>
+      <canvas id="plot" aria-label="Per-rank probability plot across the full candidate pool on a logarithmic rank axis"></canvas>
       <div class="metrics">
         <div><span>Pool mass</span><strong id="poolMass">—</strong></div>
         <div><span>JS shift</span><strong id="jsShift">—</strong></div>
-        <div><span>Entropy</span><strong id="entropy">—</strong></div>
+        <div><span>Effective choices</span><strong id="effectiveChoices">—</strong></div>
         <div><span>Peak</span><strong id="peak">—</strong></div>
-        <div class="token"><span>Selected token</span><strong id="selectedToken">—</strong></div>
+        <div class="token"><span id="selectedTokenLabel">Selected token</span><strong id="selectedToken">—</strong></div>
       </div>
     </section>
 

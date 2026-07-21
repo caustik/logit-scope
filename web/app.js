@@ -1,7 +1,7 @@
 const elements = Object.fromEntries([
-  "connection", "profile", "blend", "blendValue", "concentration", "concentrationValue",
-  "candidateCount", "seed", "protectControlTokens", "plot", "scopeCaption", "poolMass",
-  "jsShift", "entropy", "peak", "selectedToken", "transcript", "message", "clear", "stop",
+  "connection", "profile", "diversity", "diversityValue", "candidateCount", "seed",
+  "protectControlTokens", "plot", "scopeCaption", "shapedLegend", "poolMass",
+  "jsShift", "effectiveChoices", "peak", "selectedTokenLabel", "selectedToken", "transcript", "message", "clear", "stop",
   "send", "status", "error"
 ].map(id => [id, document.getElementById(id)]));
 
@@ -9,7 +9,12 @@ let snapshot = null;
 let controlsInitialized = false;
 let lastTranscript = null;
 let settingTimer = 0;
+let pendingSettings = null;
+let settingsRequestInFlight = false;
 let connected = false;
+let staleSamplingStep = null;
+let displayedSamplingView = null;
+const maximumDisplayPointCount = 64;
 
 async function request(path, options = {}) {
   const response = await fetch(path, {
@@ -24,8 +29,7 @@ async function request(path, options = {}) {
 function currentSettings() {
   return {
     profile: elements.profile.value,
-    blend: Number(elements.blend.value),
-    concentration: Number(elements.concentration.value),
+    diversity: Number(elements.diversity.value) / 100,
     candidateCount: Number(elements.candidateCount.value),
     seed: Number(elements.seed.value),
     protectControlTokens: elements.protectControlTokens.checked
@@ -33,49 +37,109 @@ function currentSettings() {
 }
 
 function updateControlLabels() {
-  elements.blendValue.value = `${Math.round(Number(elements.blend.value) * 100)}%`;
-  elements.concentrationValue.value = Number(elements.concentration.value).toFixed(2);
+  const shapingDisabled = elements.profile.value === "none";
+  const diversity = Number(elements.diversity.value) / 100;
+  elements.diversity.disabled = shapingDisabled;
+  elements.diversityValue.value = shapingDisabled ? "Bypassed" : `${elements.diversity.value}% · ${diversityMode(diversity)}`;
+}
+
+function diversityMode(diversity) {
+  if (diversity === 0) return "deterministic";
+  if (diversity === 2) return "uniform";
+  if (diversity < 1) return "sharpen";
+  if (diversity > 1) return "loosen";
+  return "raw";
 }
 
 function queueSettings() {
+  staleSamplingStep = snapshot?.samplingStep ?? 0;
   updateControlLabels();
+  pendingSettings = currentSettings();
   window.clearTimeout(settingTimer);
-  settingTimer = window.setTimeout(async () => {
-    try {
-      await request("/api/settings", { method: "POST", body: JSON.stringify(currentSettings()) });
-      elements.error.textContent = "";
-      drawPlot();
-    } catch (error) {
-      elements.error.textContent = error.message;
-    }
-  }, 35);
+  settingTimer = window.setTimeout(flushSettings, 35);
+  drawPlot();
+}
+
+async function flushSettings() {
+  window.clearTimeout(settingTimer);
+  settingTimer = 0;
+  if (settingsRequestInFlight || !pendingSettings) return;
+
+  const settings = pendingSettings;
+  pendingSettings = null;
+  settingsRequestInFlight = true;
+  try {
+    await request("/api/settings", { method: "POST", body: JSON.stringify(settings) });
+    applySnapshot(await request("/api/snapshot"));
+    elements.error.textContent = "";
+  } catch (error) {
+    elements.error.textContent = error.message;
+  } finally {
+    settingsRequestInFlight = false;
+    if (pendingSettings) settingTimer = window.setTimeout(flushSettings, 35);
+  }
 }
 
 function initializeControls(settings) {
   elements.profile.value = settings.profile;
-  elements.blend.value = settings.blend;
-  elements.concentration.value = settings.concentration;
   elements.candidateCount.value = String(settings.candidateCount);
+  elements.diversity.value = Math.round(settings.diversity * 100);
   elements.seed.value = settings.seed;
   elements.protectControlTokens.checked = settings.protectControlTokens;
   updateControlLabels();
   controlsInitialized = true;
 }
 
-function targetProbabilities(settings) {
-  const count = Math.max(2, settings.candidateCount);
-  const concentration = Math.max(0.05, Math.min(4, settings.concentration));
-  const values = new Array(count);
-  let total = 0;
-  for (let rank = 0; rank < count; ++rank) {
-    let value = 1;
-    if (settings.profile === "exponential") value = Math.exp(-concentration * rank);
-    else if (settings.profile === "power") value = Math.pow(rank + 1, -concentration);
-    else if (settings.profile === "half-normal") value = Math.exp(-0.5 * concentration * concentration * rank * rank);
-    values[rank] = Math.max(value, Number.MIN_VALUE);
-    total += values[rank];
+function displayRanks(candidateCount, maximumCount = maximumDisplayPointCount) {
+  const count = Math.max(2, candidateCount);
+  const displayCount = Math.min(maximumCount, count);
+  if (count <= displayCount) return Array.from({ length: count }, (_, rank) => rank);
+
+  const ranks = [];
+  for (let displayIndex = 0; displayIndex < displayCount; ++displayIndex) {
+    const fraction = displayIndex / (displayCount - 1);
+    const logarithmicRank = Math.round(Math.expm1(fraction * Math.log(count)));
+    const minimumRank = displayIndex === 0 ? 0 : ranks[displayIndex - 1] + 1;
+    const maximumRank = count - (displayCount - displayIndex);
+    ranks.push(Math.max(minimumRank, Math.min(maximumRank, logarithmicRank)));
   }
-  return values.slice(0, 64).map(value => value / total);
+  return ranks;
+}
+
+function sampledProbabilities(values, ranks) {
+  return values.map((value, index) => ({ rank: Number(ranks[index] ?? index), value }));
+}
+
+function hasCurrentSamplingData(settings, next = snapshot) {
+  return Boolean(next?.samplingStep) && next.samplingStep !== staleSamplingStep && next.candidateCount === settings.candidateCount;
+}
+
+function settingsMatch(left, right) {
+  return left?.profile === right.profile &&
+    Math.abs(left.diversity - right.diversity) < 0.0001 &&
+    left.candidateCount === right.candidateCount;
+}
+
+function samplingView(settings, next = snapshot) {
+  if (hasCurrentSamplingData(settings, next)) {
+    return {
+      data: next,
+      preview: false,
+      settings: next.settings,
+      representativeSampling: next.representativeSampling,
+      selectedToken: next.selectedToken
+    };
+  }
+  if (next?.preview && settingsMatch(next.settings, settings) && next.preview.candidateCount === settings.candidateCount) {
+    return { data: next.preview, preview: true, settings: next.settings };
+  }
+  return null;
+}
+
+function stableSamplingView(settings, next = snapshot) {
+  const currentView = samplingView(settings, next);
+  if (currentView) displayedSamplingView = currentView;
+  return { current: Boolean(currentView), view: currentView || displayedSamplingView };
 }
 
 function drawPlot() {
@@ -99,58 +163,96 @@ function drawPlot() {
   context.clearRect(0, 0, w, h);
 
   const settings = currentSettings();
-  const target = targetProbabilities(settings);
-  const raw = snapshot?.rawProbabilities || [];
-  const shaped = snapshot?.shapedProbabilities || [];
-  const pointCount = Math.max(2, target.length, raw.length, shaped.length);
-  const x = rank => margin.left + (rank / Math.max(1, pointCount - 1)) * plotWidth;
+  const stableView = stableSamplingView(settings);
+  const view = stableView.view;
+  const plotSettings = view?.settings || settings;
+  const shapingActive = plotSettings.profile !== "none" && plotSettings.diversity !== 1;
+  elements.shapedLegend.hidden = !shapingActive;
+  const candidateCount = Math.max(2, view?.data.candidateCount || plotSettings.candidateCount);
+  const probabilityRanks = view?.data.probabilityRanks || [];
+  const raw = sampledProbabilities(view?.data.rawProbabilities || [], probabilityRanks);
+  const shaped = sampledProbabilities(view?.data.shapedProbabilities || [], probabilityRanks);
+  const plottedProbabilities = [...raw, ...shaped].map(point => point.value).filter(value => value > 0);
+  const peakProbability = plottedProbabilities.length ? Math.max(...plottedProbabilities) : 1;
+  const maximumExponent = Math.min(0, Math.ceil(Math.log10(peakProbability)));
+  const minimumExponent = maximumExponent - 6;
+  const x = rank => margin.left + (Math.log1p(rank) / Math.log(candidateCount)) * plotWidth;
   const y = probability => {
-    const log = Math.log10(Math.max(1e-6, Math.min(1, probability)));
-    return margin.top + (-log / 6) * plotHeight;
+    const exponent = Math.log10(Math.max(Math.pow(10, minimumExponent), probability));
+    return margin.top + ((maximumExponent - exponent) / (maximumExponent - minimumExponent)) * plotHeight;
   };
 
   context.font = "10px ui-sans-serif, system-ui";
   context.textBaseline = "middle";
-  for (let exponent = 0; exponent >= -6; --exponent) {
+  for (let exponent = maximumExponent; exponent >= minimumExponent; --exponent) {
     const probability = Math.pow(10, exponent);
     const axisY = y(probability);
-    context.strokeStyle = exponent === 0 || exponent === -6 ? "#45515e" : "#27313a";
+    context.strokeStyle = exponent === maximumExponent || exponent === minimumExponent ? "#45515e" : "#27313a";
     context.lineWidth = 1;
     context.beginPath();
     context.moveTo(margin.left, axisY);
     context.lineTo(w - margin.right, axisY);
     context.stroke();
     context.fillStyle = "#7f8d9a";
-    const label = exponent === 0 ? "100%" : exponent === -1 ? "10%" : exponent === -2 ? "1%" : `${Math.pow(10, exponent + 2)}%`;
+    const percentage = probability * 100;
+    const decimalPlaces = percentage >= 1 ? 0 : Math.min(6, Math.max(1, -Math.floor(Math.log10(percentage))));
+    const label = `${percentage.toFixed(decimalPlaces)}%`;
     context.fillText(label, 7, axisY);
   }
 
-  const drawCurve = (values, color, width, alpha = 1) => {
-    if (!values || values.length < 2) return;
+  const axisRanks = displayRanks(candidateCount, 5);
+  for (const rank of axisRanks) {
+    const axisX = x(rank);
+    context.strokeStyle = rank === 0 || rank === candidateCount - 1 ? "#45515e" : "#27313a";
+    context.lineWidth = 1;
+    context.beginPath();
+    context.moveTo(axisX, margin.top);
+    context.lineTo(axisX, h - margin.bottom);
+    context.stroke();
+  }
+
+  const drawCurve = (points, color, width, alpha = 1) => {
+    const visiblePoints = points.filter(point => point.rank >= 0 && point.rank < candidateCount);
+    if (visiblePoints.length < 2) return;
     context.strokeStyle = color;
     context.globalAlpha = alpha;
     context.lineWidth = width;
     context.lineJoin = "round";
     context.beginPath();
-    values.forEach((value, rank) => {
-      const px = x(rank);
-      const py = y(value);
-      if (rank === 0) context.moveTo(px, py); else context.lineTo(px, py);
+    visiblePoints.forEach((point, index) => {
+      const px = x(point.rank);
+      const py = y(point.value);
+      if (index === 0) context.moveTo(px, py); else context.lineTo(px, py);
     });
     context.stroke();
     context.globalAlpha = 1;
   };
 
-  drawCurve(target, "#b779ff", 2.2, 0.92);
   drawCurve(raw, "#43d0c1", 1.8);
-  drawCurve(shaped, "#ff9b42", 2.0);
+  if (shapingActive) drawCurve(shaped, "#ff9b42", 2.0);
 
   context.fillStyle = "#7f8d9a";
   context.textBaseline = "alphabetic";
-  context.fillText("Rank 1", margin.left, h - 7);
-  context.textAlign = "right";
-  context.fillText(`Rank ${pointCount}`, w - margin.right, h - 7);
+  axisRanks.forEach((rank, index) => {
+    context.textAlign = index === 0 ? "left" : index === axisRanks.length - 1 ? "right" : "center";
+    const label = index === 0 ? "Top 1" : index === axisRanks.length - 1 ? `Pool ${candidateCount}` : `Top ${rank + 1}`;
+    context.fillText(label, x(rank), h - 7);
+  });
   context.textAlign = "left";
+
+  const diversityStatus = settings.profile === "none" ? "bypassed" :
+    `${Math.round(settings.diversity * 100)}% · ${diversityMode(settings.diversity)}`;
+  if (!stableView.current && view) {
+    elements.scopeCaption.textContent = `Updating preview · ${diversityStatus} · showing previous curve`;
+  } else if (view?.preview) {
+    elements.scopeCaption.textContent = `Illustrative preview · ${diversityStatus} · log-rank axis`;
+  } else if (view) {
+    const tokenStatus = view.representativeSampling ? "most uncertain token" : "selected token";
+    elements.scopeCaption.textContent =
+      `Actual token probabilities · ${diversityStatus} · ${tokenStatus} ${JSON.stringify(view.selectedToken || "")}`;
+  } else {
+    elements.scopeCaption.textContent = `Preparing preview · ${diversityStatus}`;
+  }
 }
 
 function updateTranscript(text) {
@@ -164,23 +266,36 @@ function updateTranscript(text) {
   if (wasNearBottom) elements.transcript.scrollTop = elements.transcript.scrollHeight;
 }
 
-function percentage(value, digits = 1) {
-  return Number.isFinite(value) ? `${(value * 100).toFixed(digits)}%` : "—";
+function percentage(value, digits = null) {
+  if (!Number.isFinite(value)) return "—";
+  const percent = value * 100;
+  const decimalPlaces = digits ?? (percent < 0.1 ? 3 : percent < 1 ? 2 : 1);
+  return `${percent.toFixed(decimalPlaces)}%`;
+}
+
+function effectiveChoiceCount(entropy) {
+  if (!Number.isFinite(entropy)) return "—";
+  const count = Math.exp(entropy);
+  return count < 10 ? count.toFixed(1) : count < 100 ? count.toFixed(0) : Math.round(count).toLocaleString();
 }
 
 function applySnapshot(next) {
   snapshot = next;
   if (!controlsInitialized) initializeControls(next.settings);
+  if (staleSamplingStep !== null && next.samplingStep > 0 && next.samplingStep !== staleSamplingStep) staleSamplingStep = null;
   connected = true;
   elements.connection.textContent = "Local";
   elements.connection.className = "connection online";
   elements.status.textContent = next.generating ? `${next.status} · sampling step ${next.samplingStep}` : next.status;
-  elements.scopeCaption.textContent = `Top ${next.candidateCount || next.settings.candidateCount} candidates${next.samplingStep ? ` · sampling step ${next.samplingStep}` : " · persistent target"}`;
-  elements.poolMass.textContent = next.samplingStep ? percentage(next.poolProbabilityMass) : "—";
-  elements.jsShift.textContent = next.samplingStep ? `${next.jensenShannonDivergence.toFixed(4)} nats` : "—";
-  elements.entropy.textContent = next.samplingStep ? `${next.rawEntropy.toFixed(2)} → ${next.shapedEntropy.toFixed(2)} nats` : "—";
-  elements.peak.textContent = next.samplingStep ? `${percentage(next.rawPeakProbability)} → ${percentage(next.shapedPeakProbability)}` : "—";
-  elements.selectedToken.textContent = next.selectedToken || "—";
+  const view = stableSamplingView(currentSettings(), next).view;
+  const data = view?.data;
+  elements.poolMass.textContent = data && !view.preview ? percentage(data.poolProbabilityMass) : "—";
+  elements.jsShift.textContent = data ? `${data.jensenShannonDivergence.toFixed(4)} nats` : "—";
+  elements.effectiveChoices.textContent = data ? `${effectiveChoiceCount(data.rawEntropy)} → ${effectiveChoiceCount(data.shapedEntropy)}` : "—";
+  elements.peak.textContent = data ? `${percentage(data.rawPeakProbability)} → ${percentage(data.shapedPeakProbability)}` : "—";
+  elements.selectedToken.textContent = view?.preview ? "Illustrative rank curve" : data ? view.selectedToken || "—" : "—";
+  elements.selectedTokenLabel.textContent = view?.preview ? "Preview" :
+    view?.representativeSampling ? "Most uncertain token" : "Selected token";
   updateTranscript(next.transcript || "");
 
   const canSend = next.modelLoaded && !next.generating;
@@ -218,9 +333,9 @@ async function sendMessage() {
   }
 }
 
-for (const element of [elements.profile, elements.blend, elements.concentration, elements.candidateCount, elements.seed, elements.protectControlTokens]) {
-  element.addEventListener(element.type === "range" ? "input" : "change", queueSettings);
-}
+for (const element of [elements.profile, elements.seed, elements.protectControlTokens]) element.addEventListener("change", queueSettings);
+elements.diversity.addEventListener("input", queueSettings);
+elements.candidateCount.addEventListener("change", queueSettings);
 
 elements.send.addEventListener("click", sendMessage);
 elements.stop.addEventListener("click", () => request("/api/stop", { method: "POST", body: "{}" }).catch(error => elements.error.textContent = error.message));

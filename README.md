@@ -1,25 +1,20 @@
 # Logit Scope
 
-Logit Scope is a local chat laboratory for reshaping an LLM's next-token probability distribution in real time. It preserves the model's candidate ranking, then blends the raw probabilities with a chosen rank profile while you watch the raw, target, and resulting curves.
+Logit Scope is a local chat laboratory for reshaping an LLM's next-token probability distribution in real time. It preserves the model's candidate ranking, then applies a chosen rank profile while you watch the raw and shaped curves.
 
 Created by [Aaron (`caustik`)](https://github.com/caustik) and released by APU Software, LLC.
-
-![Logit Scope reshaping ranked next-token probabilities during a local conversation](docs/images/logit-scope.png)
 
 The project is a small C++ application built directly on [llama.cpp](https://github.com/ggml-org/llama.cpp). It serves an embedded, dependency-free web interface on localhost. There is no JUCE dependency, package manager, cloud service, or separate frontend build.
 
 ## What you can manipulate
 
-- **Profile:** uniform, exponential, power, or half-normal decay by candidate rank
-- **Blend:** interpolates from the model's raw distribution (`0%`) to the target profile (`100%`)
-- **Concentration:** controls how quickly the target probability decays with rank
+- **Profile:** no shaping, or an exponential, power, or half-normal response by candidate rank
+- **Diversity:** moves from deterministic sampling at 0%, through unchanged sampling at 100%, to the uniform limit over the selected pool at 200%, subject to the protocol guard
 - **Pool:** truncates sampling to the top 32–4096 candidates
 - **Seed:** initializes the random sampler for the next response
 - **Protocol guard:** leaves control and end-of-generation logits at their raw values
 
-Profile, blend, concentration, pool, and protocol guard changes take effect on the next sampled token, including during a response. Seed changes take effect when the next response starts.
-
-![Changing the Power profile concentration while the conversation response is generated](docs/images/logit-scope-demo.gif)
+Profile, diversity, pool, and protocol guard changes take effect on the next sampled token, including during a response. Seed changes take effect when the next response starts.
 
 ## Clone and build
 
@@ -81,24 +76,30 @@ You can also set `LOGIT_SCOPE_MODEL` instead of passing `--model` each time.
 
 ## How shaping works
 
-At each sampling step, Logit Scope sorts the top `K` finite logits from highest to lowest. It evaluates a monotonically non-increasing target probability `q(r)` at each zero-based rank `r`:
+At each sampling step, Logit Scope sorts the top `K` finite logits from highest to lowest. A shaped profile supplies a monotonically increasing rank curve `f(r)`:
 
 ```text
-uniform:      q(r) ∝ 1
-exponential:  q(r) ∝ exp(-c r)
-power:        q(r) ∝ (r + 1)^(-c)
-half-normal:  q(r) ∝ exp(-0.5 c² r²)
+exponential:  f(r) = r
+power:        f(r) = log(r + 1)
+half-normal:  f(r) = r²
+
+sharpen: l'(r) = l(r) - s f(r)
+loosen:  l'(r) = l(r) + s f(r), clamped so l'(r) <= l'(r - 1)
 ```
 
-The raw rank probability `p(r)` and target are blended geometrically:
+The profile strength `s` is not exposed as a control. Instead, the shared calibrator solves for it on every token. Below 100%, diversity scales the raw entropy toward zero. Above 100%, it covers the remaining distance from raw entropy to the maximum entropy of a uniform distribution over the pool:
 
 ```text
-p'(r) ∝ p(r)^(1-b) q(r)^b
+0% ≤ diversity ≤ 100%: shaped entropy = D × raw entropy
+100% < diversity ≤ 200%: shaped entropy = raw entropy + (D - 1) × (log(K) - raw entropy)
+effective choices = exp(entropy)
 ```
 
-Here `b` is Blend and `c` is Concentration. Since both inputs are non-increasing by rank, the transformed logits preserve candidate order. `Blend = 0` is an exact shaping bypass, although the selected pool still acts as top-K truncation.
+Below 100%, the profile removes probability from lower ranks. Above 100%, it returns probability toward lower ranks while preserving the model's candidate order; 150% is halfway from the raw entropy to the pool's maximum entropy, and 200% is uniform before any protocol-guard restoration. This keeps profile experiments small: a new profile supplies one rank curve, while the common bidirectional calibration and UI contract remain unchanged. The **None** profile is an exact shaping bypass, and 100% diversity is also an exact shaping bypass, although the selected pool still acts as top-K truncation.
 
-The scope remains visible while idle so you can see the target shape before generating. During generation it overlays the raw and shaped distributions and reports pool mass, Jensen–Shannon shift, entropy, peak probability, and the selected token.
+Zero diversity is handled as an explicit boundary rather than asking the numerical calibrator to find infinite strength. The rank shaper assigns zero probability to every candidate below rank one. With **Protocol guard** enabled, protected control and end-of-generation logits are then restored and the surrounding logits are clamped to preserve candidate order, so the result is as deterministic as the guard permits rather than necessarily having exactly zero entropy.
+
+Before generation, the scope shows a clearly labeled illustrative rank curve and runs it through the same C++ shaper as real tokens, so profile, diversity, and pool changes have immediate visual feedback. The preview is not a model prediction and does not include token-specific protocol-guard effects. During generation, actual token probabilities replace the preview and the scope reports pool mass, Jensen–Shannon shift, effective choices, peak probability, and the selected token. Sampling data is published only after a non-EOG token is selected. While generation is active the plot follows the current decision; after completion it retains the response's highest-uncertainty decision instead of ending on almost-certain punctuation or EOG. The probability axis automatically follows the meaningful six-decade range for the displayed token. Its `log(1 + r)` horizontal axis spans the full pool: the left endpoint is the top-ranked candidate, and the right endpoint is the final candidate, labeled with the pool size `K`. Up to 64 display samples are distributed across that domain rather than truncating the view to the first 64 candidates.
 
 ## Project layout
 

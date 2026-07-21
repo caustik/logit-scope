@@ -3,20 +3,54 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <numeric>
-#include <string>
 
 namespace logit_scope
 {
 namespace
 {
 
-constexpr float minimum_concentration = 0.05f;
-constexpr float maximum_concentration = 4.0f;
+constexpr int calibration_iterations = 32;
 
-float clamp(float value, float minimum, float maximum) { return std::max(minimum, std::min(maximum, value)); }
+double rank_penalty(RankProfile profile, std::size_t rank)
+{
+    const auto rank_value = static_cast<double>(rank);
+    switch (profile)
+    {
+    case RankProfile::exponential:
+        return rank_value;
+    case RankProfile::power:
+        return std::log(rank_value + 1.0);
+    case RankProfile::half_normal:
+        return rank_value * rank_value;
+    case RankProfile::none:
+        return 0.0;
+    }
+    return 0.0;
+}
 
-double safe_probability(float value) { return std::max(static_cast<double>(value), std::numeric_limits<double>::min()); }
+float entropy_at_strength(const std::vector<float>& ranked_logits, RankProfile profile, double strength, bool loosen)
+{
+    if (ranked_logits.empty()) return 0.0f;
+
+    double total = 0.0;
+    double weighted_logit_total = 0.0;
+    const auto maximum_logit = static_cast<double>(ranked_logits.front());
+    auto previous_logit = maximum_logit;
+    for (std::size_t rank = 0; rank < ranked_logits.size(); ++rank)
+    {
+        const auto rank_adjustment = strength * rank_penalty(profile, rank);
+        auto shaped_logit = static_cast<double>(ranked_logits[rank]) + (loosen ? rank_adjustment : -rank_adjustment);
+        if (loosen) shaped_logit = std::min(previous_logit, shaped_logit);
+        previous_logit = shaped_logit;
+        const auto normalized_logit = shaped_logit - maximum_logit;
+        const auto weight = std::exp(normalized_logit);
+        total += weight;
+        if (weight > 0.0) weighted_logit_total += weight * normalized_logit;
+    }
+
+    total = std::max(total, std::numeric_limits<double>::min());
+    return static_cast<float>(std::log(total) - weighted_logit_total / total);
+}
 
 } // namespace
 
@@ -24,23 +58,23 @@ const char* rank_profile_name(RankProfile profile)
 {
     switch (profile)
     {
-    case RankProfile::uniform:
-        return "uniform";
+    case RankProfile::none:
+        return "none";
+    case RankProfile::exponential:
+        return "exponential";
     case RankProfile::power:
         return "power";
     case RankProfile::half_normal:
         return "half-normal";
-    case RankProfile::exponential:
-    default:
-        return "exponential";
     }
+    return "none";
 }
 
 bool parse_rank_profile(std::string_view text, RankProfile& profile)
 {
-    if (text == "uniform")
+    if (text == "none")
     {
-        profile = RankProfile::uniform;
+        profile = RankProfile::none;
         return true;
     }
     if (text == "exponential")
@@ -86,73 +120,68 @@ std::vector<float> probabilities_from_logits(const std::vector<float>& logits, P
     }
 
     ProbabilityMetrics calculated;
+    double entropy = 0.0;
     for (auto& probability : probabilities)
     {
         probability = static_cast<float>(static_cast<double>(probability) / total);
         calculated.peak_probability = std::max(calculated.peak_probability, probability);
-        if (probability > 0.0f) calculated.entropy -= probability * static_cast<float>(std::log(probability));
+        if (probability > 0.0f) entropy -= static_cast<double>(probability) * std::log(static_cast<double>(probability));
     }
+    calculated.entropy = static_cast<float>(entropy);
 
     if (metrics != nullptr) *metrics = calculated;
     return probabilities;
 }
 
-std::vector<float> target_rank_probabilities(std::size_t candidate_count, const ShapeSettings& settings)
-{
-    std::vector<float> probabilities(candidate_count);
-    if (candidate_count == 0) return probabilities;
-
-    const auto concentration = static_cast<double>(clamp(settings.concentration, minimum_concentration, maximum_concentration));
-    double total = 0.0;
-    for (std::size_t rank = 0; rank < candidate_count; ++rank)
-    {
-        const auto rank_value = static_cast<double>(rank);
-        double weight = 1.0;
-        switch (settings.profile)
-        {
-        case RankProfile::exponential:
-            weight = std::exp(-concentration * rank_value);
-            break;
-        case RankProfile::power:
-            weight = std::pow(rank_value + 1.0, -concentration);
-            break;
-        case RankProfile::half_normal:
-            weight = std::exp(-0.5 * concentration * concentration * rank_value * rank_value);
-            break;
-        case RankProfile::uniform:
-        default:
-            break;
-        }
-
-        probabilities[rank] = static_cast<float>(std::max(weight, std::numeric_limits<double>::min()));
-        total += probabilities[rank];
-    }
-
-    total = std::max(total, std::numeric_limits<double>::min());
-    for (auto& probability : probabilities) probability = static_cast<float>(static_cast<double>(probability) / total);
-    return probabilities;
-}
-
 void shape_ranked_logits(std::vector<float>& ranked_logits, const ShapeSettings& settings)
 {
-    const auto blend = clamp(settings.blend, 0.0f, 1.0f);
-    if (ranked_logits.size() < 2 || blend <= 0.0f) return;
-
-    const auto raw_probabilities = probabilities_from_logits(ranked_logits);
-    const auto target_probabilities = target_rank_probabilities(ranked_logits.size(), settings);
-    if (raw_probabilities.size() != target_probabilities.size() || raw_probabilities.empty()) return;
-
-    const auto raw_log_top = std::log(safe_probability(raw_probabilities.front()));
-    const auto target_log_top = std::log(safe_probability(target_probabilities.front()));
-    const auto blended_log_top = raw_log_top + static_cast<double>(blend) * (target_log_top - raw_log_top);
-    const auto log_normalizer = static_cast<double>(ranked_logits.front()) - blended_log_top;
-
-    for (std::size_t rank = 0; rank < ranked_logits.size(); ++rank)
+    const auto diversity = std::max(0.0f, std::min(2.0f, settings.diversity));
+    if (ranked_logits.size() < 2 || settings.profile == RankProfile::none || diversity == 1.0f) return;
+    if (diversity <= 0.0f)
     {
-        const auto raw_log_probability = std::log(safe_probability(raw_probabilities[rank]));
-        const auto target_log_probability = std::log(safe_probability(target_probabilities[rank]));
-        ranked_logits[rank] = static_cast<float>(
-            raw_log_probability + static_cast<double>(blend) * (target_log_probability - raw_log_probability) + log_normalizer);
+        std::fill(ranked_logits.begin() + 1, ranked_logits.end(), -std::numeric_limits<float>::infinity());
+        return;
+    }
+
+    ProbabilityMetrics raw_metrics;
+    probabilities_from_logits(ranked_logits, &raw_metrics);
+    const auto maximum_entropy = static_cast<float>(std::log(static_cast<double>(ranked_logits.size())));
+    const auto loosen = diversity > 1.0f;
+    if (diversity >= 2.0f)
+    {
+        std::fill(ranked_logits.begin() + 1, ranked_logits.end(), ranked_logits.front());
+        return;
+    }
+    const auto target_entropy =
+        loosen ? raw_metrics.entropy + (maximum_entropy - raw_metrics.entropy) * (diversity - 1.0f) : raw_metrics.entropy * diversity;
+
+    auto lower = 0.0;
+    auto upper = 1.0;
+    for (auto iteration = 0; iteration < calibration_iterations &&
+                             (loosen ? entropy_at_strength(ranked_logits, settings.profile, upper, true) < target_entropy
+                                     : entropy_at_strength(ranked_logits, settings.profile, upper, false) > target_entropy);
+         ++iteration)
+        upper *= 2.0;
+
+    for (auto iteration = 0; iteration < calibration_iterations; ++iteration)
+    {
+        const auto middle = (lower + upper) * 0.5;
+        const auto entropy = entropy_at_strength(ranked_logits, settings.profile, middle, loosen);
+        if (loosen ? entropy < target_entropy : entropy > target_entropy)
+            lower = middle;
+        else
+            upper = middle;
+    }
+
+    const auto strength = (lower + upper) * 0.5;
+    auto previous_logit = ranked_logits.front();
+    for (std::size_t rank = 1; rank < ranked_logits.size(); ++rank)
+    {
+        const auto rank_adjustment = strength * rank_penalty(settings.profile, rank);
+        auto shaped_logit = static_cast<double>(ranked_logits[rank]) + (loosen ? rank_adjustment : -rank_adjustment);
+        if (loosen) shaped_logit = std::min(static_cast<double>(previous_logit), shaped_logit);
+        ranked_logits[rank] = static_cast<float>(shaped_logit);
+        previous_logit = ranked_logits[rank];
     }
 }
 
