@@ -4,6 +4,8 @@ Logit Scope is a local chat laboratory for reshaping an LLM's next-token probabi
 
 Created by [Aaron (`caustik`)](https://github.com/caustik) and released by APU Software, LLC.
 
+![Logit Scope reshaping ranked next-token probabilities at 50% diversity](docs/images/logit-scope.png)
+
 The project is a small C++ application built directly on [llama.cpp](https://github.com/ggml-org/llama.cpp). It serves an embedded, dependency-free web interface on localhost. There is no JUCE dependency, package manager, cloud service, or separate frontend build.
 
 ## What you can manipulate
@@ -15,6 +17,8 @@ The project is a small C++ application built directly on [llama.cpp](https://git
 - **Protocol guard:** leaves control and end-of-generation logits at their raw values
 
 Profile, diversity, pool, and protocol guard changes take effect on the next sampled token, including during a response. Seed changes take effect when the next response starts.
+
+![Sweeping the Power profile from deterministic through raw to uniform sampling](docs/images/logit-scope-demo.gif)
 
 ## Clone and build
 
