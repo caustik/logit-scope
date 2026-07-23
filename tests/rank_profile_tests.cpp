@@ -38,7 +38,7 @@ int main()
     shape_ranked_logits(bypass, settings);
     require(bypass == original, "none profile must be exact bypass");
 
-    for (const auto profile : {RankProfile::exponential, RankProfile::power, RankProfile::half_normal})
+    for (const auto profile : {RankProfile::exponential, RankProfile::soliton, RankProfile::power, RankProfile::half_normal})
     {
         ShapeSettings identity_settings;
         identity_settings.profile = profile;
@@ -122,6 +122,15 @@ int main()
                 "extreme loosening must preserve rank");
     }
 
+    ShapeSettings soliton_settings;
+    soliton_settings.profile = RankProfile::soliton;
+    soliton_settings.diversity = 0.5f;
+    std::vector<float> soliton_logits(8, 0.0f);
+    shape_ranked_logits(soliton_logits, soliton_settings);
+    const auto soliton_gap = [&soliton_logits](std::size_t rank) { return soliton_logits[rank - 1] - soliton_logits[rank]; };
+    require(soliton_gap(1) < soliton_gap(2) && soliton_gap(2) < soliton_gap(3), "soliton profile must have a rounded low-rank crest");
+    require(soliton_gap(7) - soliton_gap(6) < soliton_gap(2) - soliton_gap(1), "soliton profile must approach exponential tail decay");
+
     settings.profile = RankProfile::half_normal;
     settings.diversity = 0.5f;
     shape_ranked_logits(bypass, settings);
@@ -132,6 +141,7 @@ int main()
 
     RankProfile parsed{};
     require(parse_rank_profile("none", parsed) && parsed == RankProfile::none, "none profile parsing");
+    require(parse_rank_profile("soliton", parsed) && parsed == RankProfile::soliton, "soliton profile parsing");
     require(parse_rank_profile("half-normal", parsed) && parsed == RankProfile::half_normal, "profile parsing");
     require(!parse_rank_profile("uniform", parsed), "uniform profile rejection");
     require(!parse_rank_profile("normal", parsed), "invalid profile rejection");

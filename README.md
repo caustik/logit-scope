@@ -10,7 +10,7 @@ The project is a small C++ application built directly on [llama.cpp](https://git
 
 ## What you can manipulate
 
-- **Profile:** no shaping, or an exponential, power, or half-normal response by candidate rank
+- **Profile:** no shaping, or an exponential, soliton, power, or half-normal response by candidate rank
 - **Diversity:** moves from deterministic sampling at 0%, through unchanged sampling at 100%, to the uniform limit over the selected pool at 200%, subject to the protocol guard
 - **Pool:** truncates sampling to the top 32–4096 candidates
 - **Seed:** initializes the random sampler for the next response
@@ -84,12 +84,15 @@ At each sampling step, Logit Scope sorts the top `K` finite logits from highest 
 
 ```text
 exponential:  f(r) = r
+soliton:      f(r) = -log(sech²(r)) = 2 log(cosh(r))
 power:        f(r) = log(r + 1)
 half-normal:  f(r) = r²
 
 sharpen: l'(r) = l(r) - s f(r)
 loosen:  l'(r) = l(r) + s f(r), clamped so l'(r) <= l'(r - 1)
 ```
+
+The **Soliton** profile takes the descending half of the canonical `sech²` [Korteweg–de Vries solitary-wave pulse](https://gfd.whoi.edu/wp-content/uploads/sites/18/2018/03/NLW1-Intro_52126.pdf) and uses its negative log as a rank penalty. It borrows that envelope as a smooth weighting curve; the sampler does not solve a wave equation. The result has a rounded shoulder across the highest-ranked candidates and approaches exponential suppression in the tail.
 
 The profile strength `s` is not exposed as a control. Instead, the shared calibrator solves for it on every token. Below 100%, diversity scales the raw entropy toward zero. Above 100%, it covers the remaining distance from raw entropy to the maximum entropy of a uniform distribution over the pool:
 

@@ -12,6 +12,7 @@ enum class RankProfile
 {
     none,
     exponential,
+    soliton,
     power,
     half_normal,
 };

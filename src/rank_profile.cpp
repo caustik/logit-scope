@@ -10,6 +10,7 @@ namespace
 {
 
 constexpr int calibration_iterations = 32;
+constexpr double logarithm_of_two = 0.693147180559945309417232121458176568;
 
 double rank_penalty(RankProfile profile, std::size_t rank)
 {
@@ -18,6 +19,9 @@ double rank_penalty(RankProfile profile, std::size_t rank)
     {
     case RankProfile::exponential:
         return rank_value;
+    case RankProfile::soliton:
+        // Stable -log(sech²(r)) form avoids overflowing cosh for large candidate pools.
+        return 2.0 * (rank_value + std::log1p(std::exp(-2.0 * rank_value)) - logarithm_of_two);
     case RankProfile::power:
         return std::log(rank_value + 1.0);
     case RankProfile::half_normal:
@@ -62,6 +66,8 @@ const char* rank_profile_name(RankProfile profile)
         return "none";
     case RankProfile::exponential:
         return "exponential";
+    case RankProfile::soliton:
+        return "soliton";
     case RankProfile::power:
         return "power";
     case RankProfile::half_normal:
@@ -80,6 +86,11 @@ bool parse_rank_profile(std::string_view text, RankProfile& profile)
     if (text == "exponential")
     {
         profile = RankProfile::exponential;
+        return true;
+    }
+    if (text == "soliton")
+    {
+        profile = RankProfile::soliton;
         return true;
     }
     if (text == "power")
