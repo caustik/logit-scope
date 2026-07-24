@@ -102,6 +102,238 @@
       </div>
     </section>
 
+    <details class="evaluation panel">
+      <summary>
+        <span>
+          <strong>Blind settings comparison</strong>
+          <small>Paired prompts, shared seeds, concealed settings, and aggregate evidence</small>
+        </span>
+        <span class="evaluation-badge">Evaluation lab</span>
+      </summary>
+
+      <div class="evaluation-body">
+        <div class="evaluation-intro">
+          <p>Each trial generates two isolated responses with the same prompt and seed. Their order is randomized and their settings stay hidden until you submit a structured judgment.</p>
+          <p>Length and repetition are diagnostics, not quality scores. Use varied prompts and at least 10 non-tied judgments before treating a preference as more than exploratory.</p>
+        </div>
+
+        <div class="evaluation-configs">
+          <fieldset class="evaluation-config">
+            <legend>Configuration A</legend>
+            <label>
+              <span>Name</span>
+              <input id="evalNameA" type="text" value="Raw baseline">
+            </label>
+            <div class="evaluation-config-grid">
+              <label>
+                <span>Profile</span>
+                <select id="evalProfileA">
+                  <option value="none" selected>None</option>
+                  <option value="exponential">Exponential</option>
+                  <option value="soliton">Soliton</option>
+                  <option value="power">Power</option>
+                  <option value="half-normal">Half-normal</option>
+                </select>
+              </label>
+              <label>
+                <span>Diversity</span>
+                <input id="evalDiversityA" type="number" min="0" max="200" step="1" value="100">
+              </label>
+              <label>
+                <span>Candidate cap</span>
+                <select id="evalCapA">
+                  <option>32</option><option selected>64</option><option>128</option><option>256</option>
+                  <option>512</option><option>1024</option><option>2048</option><option>4096</option>
+                </select>
+              </label>
+              <label>
+                <span>Min-P floor</span>
+                <select id="evalFloorA">
+                  <option value="0">Off</option>
+                  <option value="0.001">0.1%</option>
+                  <option value="0.005">0.5%</option>
+                  <option value="0.01" selected>1%</option>
+                  <option value="0.02">2%</option>
+                  <option value="0.05">5%</option>
+                  <option value="0.1">10%</option>
+                </select>
+              </label>
+            </div>
+            <div class="evaluation-config-actions">
+              <label class="check-control">
+                <input id="evalGuardA" type="checkbox" checked>
+                <span>Protocol guard</span>
+              </label>
+              <button id="evalUseCurrentA" class="secondary" type="button">Use current controls</button>
+            </div>
+          </fieldset>
+
+          <fieldset class="evaluation-config">
+            <legend>Configuration B</legend>
+            <label>
+              <span>Name</span>
+              <input id="evalNameB" type="text" value="Soliton 188%">
+            </label>
+            <div class="evaluation-config-grid">
+              <label>
+                <span>Profile</span>
+                <select id="evalProfileB">
+                  <option value="none">None</option>
+                  <option value="exponential">Exponential</option>
+                  <option value="soliton" selected>Soliton</option>
+                  <option value="power">Power</option>
+                  <option value="half-normal">Half-normal</option>
+                </select>
+              </label>
+              <label>
+                <span>Diversity</span>
+                <input id="evalDiversityB" type="number" min="0" max="200" step="1" value="188">
+              </label>
+              <label>
+                <span>Candidate cap</span>
+                <select id="evalCapB">
+                  <option>32</option><option selected>64</option><option>128</option><option>256</option>
+                  <option>512</option><option>1024</option><option>2048</option><option>4096</option>
+                </select>
+              </label>
+              <label>
+                <span>Min-P floor</span>
+                <select id="evalFloorB">
+                  <option value="0">Off</option>
+                  <option value="0.001">0.1%</option>
+                  <option value="0.005">0.5%</option>
+                  <option value="0.01" selected>1%</option>
+                  <option value="0.02">2%</option>
+                  <option value="0.05">5%</option>
+                  <option value="0.1">10%</option>
+                </select>
+              </label>
+            </div>
+            <div class="evaluation-config-actions">
+              <label class="check-control">
+                <input id="evalGuardB" type="checkbox" checked>
+                <span>Protocol guard</span>
+              </label>
+              <button id="evalUseCurrentB" class="secondary" type="button">Use current controls</button>
+            </div>
+          </fieldset>
+        </div>
+
+        <div class="evaluation-runner">
+          <label class="evaluation-prompts">
+            <span>Test prompts <small>one prompt per line</small></span>
+            <textarea id="evalPrompts" rows="4">Write exactly 90 words in the voice of an eccentric lighthouse welcoming dawn after a storm.
+Explain in about 90 words why leaves change color, for a curious ten-year-old.
+Suggest five unusual but practical ways to make a small apartment feel calmer.</textarea>
+          </label>
+          <div class="evaluation-run-options">
+            <label>
+              <span>Repeats per prompt</span>
+              <input id="evalRepeats" type="number" min="1" max="10" step="1" value="1">
+            </label>
+            <label>
+              <span>Starting seed</span>
+              <input id="evalSeedStart" type="number" min="0" max="4294967295" step="1" value="1234">
+            </label>
+          </div>
+          <div class="evaluation-run-actions">
+            <button id="evalStart" class="primary" type="button">Generate blinded pairs</button>
+            <button id="evalCancel" class="secondary" type="button" disabled>Stop run</button>
+          </div>
+          <div class="evaluation-progress">
+            <strong id="evalRunStatus">Ready to compare.</strong>
+            <span id="evalProgress"></span>
+          </div>
+        </div>
+
+        <section id="evalJudge" class="evaluation-judge" hidden>
+          <div class="evaluation-judge-heading">
+            <div>
+              <h2 id="evalTrialLabel">Blind trial</h2>
+              <p id="evalPromptDisplay"></p>
+            </div>
+            <button id="evalNext" class="secondary" type="button">Next unjudged pair</button>
+          </div>
+
+          <div class="evaluation-responses">
+            <article>
+              <h3>Response left</h3>
+              <pre id="evalLeftResponse"></pre>
+              <div id="evalLeftMetrics" class="evaluation-response-metrics"></div>
+            </article>
+            <article>
+              <h3>Response right</h3>
+              <pre id="evalRightResponse"></pre>
+              <div id="evalRightMetrics" class="evaluation-response-metrics"></div>
+            </article>
+          </div>
+
+          <div id="evalRubric" class="evaluation-rubric">
+            <div class="evaluation-rating-heading">
+              <span>Criterion</span><span>Left</span><span>Right</span>
+            </div>
+            <label>
+              <span>Task fit</span>
+              <select id="evalTaskLeft"><option value="">—</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
+              <select id="evalTaskRight"><option value="">—</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
+            </label>
+            <label>
+              <span>Coherence</span>
+              <select id="evalCoherenceLeft"><option value="">—</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
+              <select id="evalCoherenceRight"><option value="">—</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
+            </label>
+            <label>
+              <span>Style / usefulness</span>
+              <select id="evalStyleLeft"><option value="">—</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
+              <select id="evalStyleRight"><option value="">—</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
+            </label>
+
+            <fieldset class="evaluation-preference">
+              <legend>Overall preference</legend>
+              <label><input type="radio" name="evalPreference" value="left"> Left</label>
+              <label><input type="radio" name="evalPreference" value="tie"> Tie</label>
+              <label><input type="radio" name="evalPreference" value="right"> Right</label>
+            </fieldset>
+
+            <label>
+              <span>Optional note</span>
+              <textarea id="evalNotes" rows="2" placeholder="What made the difference?"></textarea>
+            </label>
+            <button id="evalSubmitJudgment" class="primary" type="button">Submit judgment and reveal settings</button>
+          </div>
+
+          <div id="evalReveal" class="evaluation-reveal" hidden></div>
+        </section>
+
+        <section class="evaluation-results">
+          <div class="evaluation-results-heading">
+            <div>
+              <h2>Evaluation evidence</h2>
+              <p id="evalSummary">No completed judgments yet.</p>
+            </div>
+            <label>
+              <span>Experiment</span>
+              <select id="evalExperiment"></select>
+            </label>
+          </div>
+          <div class="evaluation-table-wrap">
+            <table>
+              <thead>
+                <tr><th>Configuration</th><th>Preference</th><th>W / T / L</th><th>Task fit</th><th>Coherence</th><th>Style</th><th>Words</th><th>Repeated trigrams</th></tr>
+              </thead>
+              <tbody id="evalSummaryBody"></tbody>
+            </table>
+          </div>
+          <div class="evaluation-history-actions">
+            <button id="evalExportJson" class="secondary" type="button">Export JSON</button>
+            <button id="evalExportCsv" class="secondary" type="button">Export CSV</button>
+            <button id="evalDelete" class="secondary danger" type="button">Delete experiment</button>
+            <span>Results stay in this browser until exported or deleted.</span>
+          </div>
+        </section>
+      </div>
+    </details>
+
     <footer>
       <div id="status">Starting llama.cpp…</div>
       <div id="error" role="alert"></div>

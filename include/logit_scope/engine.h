@@ -3,6 +3,7 @@
 #include "logit_scope/rank_profile.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <array>
@@ -44,6 +45,16 @@ struct SamplingSnapshot
     float jensen_shannon_divergence = 0.0f;
 };
 
+struct EvaluationResult
+{
+    std::uint64_t id = 0;
+    bool generating = false;
+    bool ready = false;
+    std::string response;
+    std::string status;
+    int token_count = 0;
+};
+
 class Engine
 {
   public:
@@ -56,6 +67,7 @@ class Engine
     void start();
     void stop();
     bool submit_message(std::string message);
+    std::uint64_t submit_evaluation(std::string prompt, const ShapeSettings& settings);
     void cancel_generation();
     void clear_conversation();
 
@@ -63,6 +75,7 @@ class Engine
     void set_shape_settings(const ShapeSettings& settings);
     SamplingSnapshot snapshot() const;
     SamplingSnapshot preview_snapshot(const ShapeSettings& settings) const;
+    EvaluationResult evaluation_result() const;
 
   private:
     class Impl;

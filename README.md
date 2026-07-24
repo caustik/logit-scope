@@ -23,6 +23,20 @@ Profile, diversity, candidate-policy, and protocol-guard changes take effect on 
 
 ![Exploring diversity around the default Soliton personality](docs/images/logit-scope-demo.gif)
 
+## Blind evaluation lab
+
+The **Blind settings comparison** panel turns a settings impression into a repeatable paired experiment:
+
+1. Define configurations A and B. The supplied starting comparison holds the candidate policy constant and compares the raw bypass against the default Soliton personality.
+2. Add several prompts and choose repeats. Every pair uses the same prompt and seed in two isolated one-turn conversations; the normal chat and controls are restored after each response.
+3. Generate the pairs. Response placement is randomized, generation order is randomized, and configuration identities stay concealed while judging.
+4. Score both responses from 1–5 for task fit, coherence, and style/usefulness, then choose left, tie, or right. Settings and diagnostics reveal only after the judgment is saved.
+5. Read the aggregate preference score, win/tie/loss counts, mean rubric ratings, word counts, repeated-trigram rates, and two-sided exact sign-test result. Export the full experiment as JSON or CSV for outside analysis.
+
+Blind pairwise comparison reduces expectation and position effects; position bias is a documented concern in LLM evaluation, including [MT-Bench and Chatbot Arena](https://arxiv.org/abs/2306.05685). Paired prompts and seeds reduce nuisance variation, while multiple task types test whether a setting generalizes beyond one appealing sample.
+
+The lab produces better evidence, not an automatic definition of quality. A single evaluator is still expressing preferences, a low repetition rate does not prove a good response, and a sign-test p-value measures consistency of the recorded choices rather than practical importance. Use varied prompts, inspect rubric dimensions rather than only overall wins, and collect at least 10 non-tied decisions before treating the result as more than exploratory. Experiments remain in browser-local storage until exported or deleted.
+
 ## Clone and build
 
 Prerequisites are Git, CMake 3.21 or newer, and a C++17 compiler. Ninja is used by the supplied macOS/Linux presets. On Windows, the preset uses Visual Studio 2022.

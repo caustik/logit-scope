@@ -151,6 +151,52 @@ class Engine::Impl
         return true;
     }
 
+    std::uint64_t submit_evaluation(std::string prompt, const ShapeSettings& settings)
+    {
+        prompt.erase(prompt.begin(), std::find_if(prompt.begin(), prompt.end(), [](unsigned char value) { return !std::isspace(value); }));
+        while (!prompt.empty() && std::isspace(static_cast<unsigned char>(prompt.back()))) prompt.pop_back();
+        if (prompt.empty()) return 0;
+
+        {
+            const std::lock_guard evaluation_lock(evaluation_mutex_);
+            if (evaluation_in_progress_) return 0;
+            evaluation_in_progress_ = true;
+        }
+
+        EvaluationRequest request;
+        request.id = next_evaluation_id_.fetch_add(1);
+        request.prompt = std::move(prompt);
+        request.settings = settings;
+        request.restoration_settings = shape_settings();
+        {
+            const std::lock_guard snapshot_lock(snapshot_mutex_);
+            if (!snapshot_.model_loaded || snapshot_.generating)
+            {
+                const std::lock_guard evaluation_lock(evaluation_mutex_);
+                evaluation_in_progress_ = false;
+                return 0;
+            }
+            request.restoration_snapshot = snapshot_;
+            snapshot_.generating = true;
+            snapshot_.status = "Evaluating...";
+        }
+        {
+            const std::lock_guard evaluation_lock(evaluation_mutex_);
+            evaluation_result_ = {};
+            evaluation_result_.id = request.id;
+            evaluation_result_.generating = true;
+            evaluation_result_.status = "Generating blinded response...";
+        }
+        const auto id = request.id;
+        {
+            const std::lock_guard queue_lock(queue_mutex_);
+            pending_evaluations_.push_back(std::move(request));
+        }
+        cancel_requested_.store(false);
+        queue_condition_.notify_one();
+        return id;
+    }
+
     void cancel_generation()
     {
         cancel_requested_.store(true);
@@ -240,6 +286,12 @@ class Engine::Impl
         return preview_snapshot_;
     }
 
+    EvaluationResult evaluation_result() const
+    {
+        const std::lock_guard lock(evaluation_mutex_);
+        return evaluation_result_;
+    }
+
   private:
     struct SamplerContext
     {
@@ -264,6 +316,15 @@ class Engine::Impl
         float jensen_shannon_divergence = 0.0f;
     };
 
+    struct EvaluationRequest
+    {
+        std::uint64_t id = 0;
+        std::string prompt;
+        ShapeSettings settings;
+        ShapeSettings restoration_settings;
+        SamplingSnapshot restoration_snapshot;
+    };
+
     void run()
     {
         if (!initialize_model()) return;
@@ -271,15 +332,26 @@ class Engine::Impl
         while (!stop_requested_.load())
         {
             std::string message;
+            EvaluationRequest evaluation;
             {
                 std::unique_lock lock(queue_mutex_);
                 queue_condition_.wait(lock,
-                                      [this] { return stop_requested_.load() || reset_requested_.load() || !pending_messages_.empty(); });
+                                      [this]
+                                      {
+                                          return stop_requested_.load() || reset_requested_.load() || !pending_messages_.empty() ||
+                                                 !pending_evaluations_.empty();
+                                      });
                 if (stop_requested_.load()) break;
 
                 if (reset_requested_.exchange(false))
                 {
                     pending_messages_.clear();
+                    pending_evaluations_.clear();
+                    {
+                        const std::lock_guard evaluation_lock(evaluation_mutex_);
+                        evaluation_result_ = {};
+                        evaluation_in_progress_ = false;
+                    }
                     pending_sampling_ = {};
                     representative_sampling_ = {};
                     messages_.clear();
@@ -302,12 +374,63 @@ class Engine::Impl
                     message = std::move(pending_messages_.front());
                     pending_messages_.pop_front();
                 }
+                else if (!pending_evaluations_.empty())
+                {
+                    evaluation = std::move(pending_evaluations_.front());
+                    pending_evaluations_.pop_front();
+                }
             }
 
-            if (!message.empty()) process_message(message);
+            if (!message.empty())
+                process_message(message);
+            else if (evaluation.id != 0)
+                process_evaluation(std::move(evaluation));
         }
 
         release_model();
+    }
+
+    void process_evaluation(EvaluationRequest request)
+    {
+        auto saved_messages = std::move(messages_);
+        auto saved_response = std::move(current_response_);
+        const auto saved_pending_sampling = pending_sampling_;
+        const auto saved_representative_sampling = representative_sampling_;
+
+        messages_.clear();
+        current_response_.clear();
+        pending_sampling_ = {};
+        representative_sampling_ = {};
+        previous_formatted_length_ = 0;
+        if (context_ != nullptr) llama_memory_clear(llama_get_memory(context_), true);
+        set_shape_settings(request.settings);
+
+        process_message(request.prompt);
+        const auto generated_snapshot = snapshot();
+
+        EvaluationResult result;
+        result.id = request.id;
+        result.ready = true;
+        result.response = sanitize_utf8(current_response_);
+        result.status = generated_snapshot.status;
+        result.token_count = generated_snapshot.sampling_step;
+
+        messages_ = std::move(saved_messages);
+        current_response_ = std::move(saved_response);
+        pending_sampling_ = saved_pending_sampling;
+        representative_sampling_ = saved_representative_sampling;
+        set_shape_settings(request.restoration_settings);
+        previous_formatted_length_ = 0;
+        if (context_ != nullptr) llama_memory_clear(llama_get_memory(context_), true);
+        {
+            const std::lock_guard snapshot_lock(snapshot_mutex_);
+            snapshot_ = std::move(request.restoration_snapshot);
+        }
+        {
+            const std::lock_guard evaluation_lock(evaluation_mutex_);
+            evaluation_result_ = std::move(result);
+            evaluation_in_progress_ = false;
+        }
     }
 
     bool initialize_model()
@@ -894,6 +1017,7 @@ class Engine::Impl
     mutable std::mutex queue_mutex_;
     std::condition_variable queue_condition_;
     std::deque<std::string> pending_messages_;
+    std::deque<EvaluationRequest> pending_evaluations_;
 
     mutable std::mutex snapshot_mutex_;
     SamplingSnapshot snapshot_;
@@ -903,6 +1027,11 @@ class Engine::Impl
     mutable bool preview_valid_ = false;
     PendingSamplingData pending_sampling_;
     PendingSamplingData representative_sampling_;
+
+    mutable std::mutex evaluation_mutex_;
+    EvaluationResult evaluation_result_;
+    bool evaluation_in_progress_ = false;
+    std::atomic<std::uint64_t> next_evaluation_id_{1};
 
     std::vector<ChatMessage> messages_;
     std::string current_response_;
@@ -925,6 +1054,11 @@ void Engine::stop() { impl_->stop(); }
 
 bool Engine::submit_message(std::string message) { return impl_->submit_message(std::move(message)); }
 
+std::uint64_t Engine::submit_evaluation(std::string prompt, const ShapeSettings& settings)
+{
+    return impl_->submit_evaluation(std::move(prompt), settings);
+}
+
 void Engine::cancel_generation() { impl_->cancel_generation(); }
 
 void Engine::clear_conversation() { impl_->clear_conversation(); }
@@ -936,5 +1070,7 @@ void Engine::set_shape_settings(const ShapeSettings& settings) { impl_->set_shap
 SamplingSnapshot Engine::snapshot() const { return impl_->snapshot(); }
 
 SamplingSnapshot Engine::preview_snapshot(const ShapeSettings& settings) const { return impl_->preview_snapshot(settings); }
+
+EvaluationResult Engine::evaluation_result() const { return impl_->evaluation_result(); }
 
 } // namespace logit_scope

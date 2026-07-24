@@ -2,7 +2,13 @@ const elements = Object.fromEntries([
   "connection", "profile", "diversity", "diversityValue", "candidateCap", "minimumRelativeProbability", "seed",
   "protectControlTokens", "plot", "scopeCaption", "shapedLegend", "poolMass",
   "jsShift", "effectiveChoices", "peak", "selectedTokenLabel", "selectedToken", "transcript", "message", "clear", "stop",
-  "send", "status", "error"
+  "send", "status", "error", "evalNameA", "evalProfileA", "evalDiversityA", "evalCapA", "evalFloorA", "evalGuardA",
+  "evalUseCurrentA", "evalNameB", "evalProfileB", "evalDiversityB", "evalCapB", "evalFloorB", "evalGuardB",
+  "evalUseCurrentB", "evalPrompts", "evalRepeats", "evalSeedStart", "evalStart", "evalCancel", "evalRunStatus",
+  "evalProgress", "evalJudge", "evalTrialLabel", "evalPromptDisplay", "evalNext", "evalLeftResponse", "evalRightResponse",
+  "evalLeftMetrics", "evalRightMetrics", "evalRubric", "evalTaskLeft", "evalTaskRight", "evalCoherenceLeft",
+  "evalCoherenceRight", "evalStyleLeft", "evalStyleRight", "evalNotes", "evalSubmitJudgment", "evalReveal",
+  "evalSummary", "evalExperiment", "evalSummaryBody", "evalExportJson", "evalExportCsv", "evalDelete"
 ].map(id => [id, document.getElementById(id)]));
 
 let snapshot = null;
@@ -14,7 +20,15 @@ let settingsRequestInFlight = false;
 let connected = false;
 let staleSamplingStep = null;
 let displayedSamplingView = null;
+let evaluationDefaultsInitialized = false;
+let evaluationRunning = false;
+let evaluationCancelRequested = false;
+let currentEvaluationTrialId = null;
 const maximumDisplayPointCount = 64;
+const evaluationStorageKey = "logit-scope-evaluations-v1";
+const evaluationActiveKey = "logit-scope-active-evaluation-v1";
+let evaluationStore = loadEvaluationStore();
+let activeEvaluationId = loadActiveEvaluationId();
 
 async function request(path, options = {}) {
   const response = await fetch(path, {
@@ -92,6 +106,13 @@ function initializeControls(settings) {
   elements.protectControlTokens.checked = settings.protectControlTokens;
   updateControlLabels();
   controlsInitialized = true;
+  if (!evaluationDefaultsInitialized) {
+    setEvaluationConfig("A", { ...settings, profile: "none", diversity: 1 });
+    setEvaluationConfig("B", settings);
+    elements.evalNameA.value = "Raw baseline";
+    elements.evalNameB.value = `${profileDisplayName(settings.profile)} ${Math.round(settings.diversity * 100)}%`;
+    evaluationDefaultsInitialized = true;
+  }
 }
 
 function displayRanks(candidateCount, maximumCount = maximumDisplayPointCount) {
@@ -294,7 +315,7 @@ function drawPlot() {
 
 function updateTranscript(text) {
   const wasNearBottom = elements.transcript.scrollHeight - elements.transcript.scrollTop - elements.transcript.clientHeight < 45;
-  if (lastTranscript !== null && text.startsWith(lastTranscript)) {
+  if (lastTranscript && text.startsWith(lastTranscript)) {
     elements.transcript.append(document.createTextNode(text.slice(lastTranscript.length)));
   } else {
     elements.transcript.textContent = text || "Start a conversation.";
@@ -333,13 +354,14 @@ function applySnapshot(next) {
   elements.selectedToken.textContent = view?.preview ? "Illustrative rank curve" : data ? view.selectedToken || "—" : "—";
   elements.selectedTokenLabel.textContent = view?.preview ? "Preview" :
     view?.representativeSampling ? "Most uncertain token" : "Selected token";
-  updateTranscript(next.transcript || "");
+  updateTranscript(evaluationRunning ? "Blind comparison in progress. Responses stay concealed until each pair is ready." : next.transcript || "");
 
-  const canSend = next.modelLoaded && !next.generating;
+  const canSend = next.modelLoaded && !next.generating && !evaluationRunning;
   elements.send.disabled = !canSend;
   elements.message.disabled = !canSend;
   elements.stop.disabled = !next.generating;
   elements.clear.disabled = !next.modelLoaded;
+  elements.evalStart.disabled = evaluationRunning || !next.modelLoaded || next.generating;
   drawPlot();
 }
 
@@ -370,6 +392,554 @@ async function sendMessage() {
   }
 }
 
+function loadEvaluationStore() {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(evaluationStorageKey));
+    if (stored?.version === 1 && Array.isArray(stored.experiments)) return stored;
+  } catch {
+    // A malformed or unavailable local store should not block the application.
+  }
+  return { version: 1, experiments: [] };
+}
+
+function loadActiveEvaluationId() {
+  try {
+    return window.localStorage.getItem(evaluationActiveKey);
+  } catch {
+    return null;
+  }
+}
+
+function saveEvaluationStore() {
+  evaluationStore.experiments = evaluationStore.experiments.slice(-20);
+  try {
+    window.localStorage.setItem(evaluationStorageKey, JSON.stringify(evaluationStore));
+    if (activeEvaluationId) window.localStorage.setItem(evaluationActiveKey, activeEvaluationId);
+  } catch (error) {
+    elements.error.textContent = `Evaluation results could not be saved: ${error.message}`;
+  }
+}
+
+function profileDisplayName(profile) {
+  return {
+    none: "None",
+    exponential: "Exponential",
+    soliton: "Soliton",
+    power: "Power",
+    "half-normal": "Half-normal"
+  }[profile] || profile;
+}
+
+function evaluationField(side, name) {
+  return elements[`eval${name}${side}`];
+}
+
+function setEvaluationConfig(side, settings) {
+  evaluationField(side, "Profile").value = settings.profile;
+  evaluationField(side, "Diversity").value = Math.round(settings.diversity * 100);
+  evaluationField(side, "Cap").value = String(settings.candidateCap);
+  const floorSelect = evaluationField(side, "Floor");
+  const nearestFloor = Array.from(floorSelect.options).reduce((nearest, option) =>
+    Math.abs(Number(option.value) - settings.minimumRelativeProbability) <
+    Math.abs(Number(nearest.value) - settings.minimumRelativeProbability) ? option : nearest);
+  floorSelect.value = nearestFloor.value;
+  evaluationField(side, "Guard").checked = settings.protectControlTokens;
+  updateEvaluationConfigControls(side);
+}
+
+function evaluationSettings(side) {
+  return {
+    profile: evaluationField(side, "Profile").value,
+    diversity: Math.max(0, Math.min(2, Number(evaluationField(side, "Diversity").value) / 100)),
+    candidateCap: Number(evaluationField(side, "Cap").value),
+    minimumRelativeProbability: Number(evaluationField(side, "Floor").value),
+    protectControlTokens: evaluationField(side, "Guard").checked
+  };
+}
+
+function updateEvaluationConfigControls(side) {
+  const bypassed = evaluationField(side, "Profile").value === "none";
+  evaluationField(side, "Diversity").disabled = evaluationRunning || bypassed;
+}
+
+function useCurrentControlsForEvaluation(side) {
+  const settings = currentSettings();
+  setEvaluationConfig(side, settings);
+  evaluationField(side, "Name").value =
+    settings.profile === "none" ? "Raw baseline" : `${profileDisplayName(settings.profile)} ${Math.round(settings.diversity * 100)}%`;
+}
+
+function activeEvaluation() {
+  return evaluationStore.experiments.find(experiment => experiment.id === activeEvaluationId) || null;
+}
+
+function evaluationExperimentLabel(experiment) {
+  const date = new Date(experiment.startedAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" });
+  const judged = experiment.trials.filter(trial => trial.judgment).length;
+  return `${date} · ${experiment.nameA} vs ${experiment.nameB} · ${judged}/${experiment.trials.length} judged`;
+}
+
+function renderEvaluationSelector() {
+  elements.evalExperiment.replaceChildren();
+  if (!evaluationStore.experiments.length) {
+    const option = document.createElement("option");
+    option.textContent = "No experiments";
+    option.value = "";
+    elements.evalExperiment.append(option);
+    elements.evalExperiment.disabled = true;
+    return;
+  }
+
+  if (!activeEvaluation()) activeEvaluationId = evaluationStore.experiments.at(-1).id;
+  for (const experiment of [...evaluationStore.experiments].reverse()) {
+    const option = document.createElement("option");
+    option.value = experiment.id;
+    option.textContent = evaluationExperimentLabel(experiment);
+    elements.evalExperiment.append(option);
+  }
+  elements.evalExperiment.value = activeEvaluationId;
+  elements.evalExperiment.disabled = false;
+}
+
+function parseEvaluationPrompts() {
+  return elements.evalPrompts.value.split(/\r?\n/).map(prompt => prompt.trim()).filter(Boolean);
+}
+
+function randomBoolean() {
+  const value = new Uint32Array(1);
+  window.crypto.getRandomValues(value);
+  return Boolean(value[0] & 1);
+}
+
+function createEvaluationId() {
+  const random = new Uint32Array(1);
+  window.crypto.getRandomValues(random);
+  return `${Date.now().toString(36)}-${random[0].toString(36)}`;
+}
+
+function setEvaluationRunning(running) {
+  evaluationRunning = running;
+  const setupControls = [
+    "evalNameA", "evalProfileA", "evalDiversityA", "evalCapA", "evalFloorA", "evalGuardA", "evalUseCurrentA",
+    "evalNameB", "evalProfileB", "evalDiversityB", "evalCapB", "evalFloorB", "evalGuardB", "evalUseCurrentB",
+    "evalPrompts", "evalRepeats", "evalSeedStart"
+  ];
+  const primaryControls = [
+    "profile", "diversity", "candidateCap", "minimumRelativeProbability", "seed", "protectControlTokens", "message",
+    "clear", "send"
+  ];
+  for (const id of [...setupControls, ...primaryControls]) elements[id].disabled = running;
+  elements.evalStart.disabled = running || !snapshot?.modelLoaded || snapshot?.generating;
+  elements.evalCancel.disabled = !running;
+  elements.evalDelete.disabled = running || !activeEvaluation();
+  if (!running) {
+    updateControlLabels();
+    updateEvaluationConfigControls("A");
+    updateEvaluationConfigControls("B");
+    if (snapshot) applySnapshot(snapshot);
+  }
+}
+
+function evaluationDelay(milliseconds) {
+  return new Promise(resolve => window.setTimeout(resolve, milliseconds));
+}
+
+async function generateEvaluationResponse(prompt, settings, seed) {
+  const accepted = await request("/api/evaluation", {
+    method: "POST",
+    body: JSON.stringify({ prompt, settings: { ...settings, seed } })
+  });
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < deadline) {
+    if (evaluationCancelRequested) throw new Error("Comparison stopped");
+    const result = await request("/api/evaluation");
+    if (result.id === accepted.id && result.ready) return result;
+    await evaluationDelay(85);
+  }
+  throw new Error("Evaluation response timed out");
+}
+
+function responseMetrics(response, tokenCount) {
+  const words = response.toLocaleLowerCase().match(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu) || [];
+  const trigrams = [];
+  for (let index = 0; index + 2 < words.length; ++index) trigrams.push(words.slice(index, index + 3).join(" "));
+  const uniqueWords = new Set(words);
+  const uniqueTrigrams = new Set(trigrams);
+  return {
+    tokenCount,
+    characterCount: response.length,
+    wordCount: words.length,
+    uniqueWordRatio: words.length ? uniqueWords.size / words.length : 0,
+    repeatedTrigramRatio: trigrams.length ? 1 - uniqueTrigrams.size / trigrams.length : 0
+  };
+}
+
+async function startEvaluation() {
+  if (evaluationRunning) return;
+  const prompts = parseEvaluationPrompts();
+  const repeats = Math.max(1, Math.min(10, Number(elements.evalRepeats.value) || 1));
+  const seedStart = Math.max(0, Math.min(4294967295, Number(elements.evalSeedStart.value) || 0));
+  const nameA = elements.evalNameA.value.trim() || "Configuration A";
+  const nameB = elements.evalNameB.value.trim() || "Configuration B";
+  const settingsA = evaluationSettings("A");
+  const settingsB = evaluationSettings("B");
+  if (!snapshot?.modelLoaded || snapshot.generating) {
+    elements.error.textContent = "The model must be ready before starting a comparison.";
+    return;
+  }
+  if (!prompts.length) {
+    elements.error.textContent = "Add at least one evaluation prompt.";
+    return;
+  }
+  if (nameA === nameB) {
+    elements.error.textContent = "Give the two configurations distinct names.";
+    return;
+  }
+  if (JSON.stringify(settingsA) === JSON.stringify(settingsB)) {
+    elements.error.textContent = "The two configurations are identical.";
+    return;
+  }
+
+  const experiment = {
+    id: createEvaluationId(),
+    startedAt: new Date().toISOString(),
+    nameA,
+    nameB,
+    settingsA,
+    settingsB,
+    prompts,
+    repeats,
+    seedStart,
+    trials: []
+  };
+  evaluationStore.experiments.push(experiment);
+  activeEvaluationId = experiment.id;
+  saveEvaluationStore();
+  renderEvaluationSelector();
+  renderEvaluationSummary();
+
+  evaluationCancelRequested = false;
+  setEvaluationRunning(true);
+  elements.error.textContent = "";
+  const pairCount = prompts.length * repeats;
+  let pairIndex = 0;
+
+  try {
+    for (let repeat = 0; repeat < repeats; ++repeat) {
+      for (const prompt of prompts) {
+        if (evaluationCancelRequested) throw new Error("Comparison stopped");
+        const seed = (seedStart + pairIndex) % 4294967296;
+        const generationOrder = randomBoolean() ? ["A", "B"] : ["B", "A"];
+        const responses = {};
+        elements.evalProgress.textContent = `${pairIndex + 1} / ${pairCount} pairs`;
+
+        for (let generationIndex = 0; generationIndex < generationOrder.length; ++generationIndex) {
+          const key = generationOrder[generationIndex];
+          elements.evalRunStatus.textContent =
+            `Generating concealed response ${generationIndex + 1} of 2 for pair ${pairIndex + 1}…`;
+          responses[key] = await generateEvaluationResponse(prompt, key === "A" ? settingsA : settingsB, seed);
+        }
+
+        const trial = {
+          id: `${experiment.id}-${pairIndex}`,
+          prompt,
+          seed,
+          generationOrder,
+          leftIsA: randomBoolean(),
+          responseA: responses.A.response,
+          responseB: responses.B.response,
+          statusA: responses.A.status,
+          statusB: responses.B.status,
+          metricsA: responseMetrics(responses.A.response, responses.A.tokenCount),
+          metricsB: responseMetrics(responses.B.response, responses.B.tokenCount),
+          generatedAt: new Date().toISOString(),
+          judgment: null
+        };
+        experiment.trials.push(trial);
+        ++pairIndex;
+        saveEvaluationStore();
+        renderEvaluationSelector();
+        renderEvaluationSummary();
+        if (!currentEvaluationTrialId) showEvaluationTrial(trial);
+      }
+    }
+    elements.evalRunStatus.textContent = `Generated ${pairIndex} blinded ${pairIndex === 1 ? "pair" : "pairs"}.`;
+    elements.evalProgress.textContent = "Judge every pair before interpreting the aggregate.";
+  } catch (error) {
+    elements.evalRunStatus.textContent = evaluationCancelRequested ? `Stopped after ${pairIndex} complete pairs.` : "Comparison failed.";
+    elements.evalProgress.textContent = "";
+    if (!evaluationCancelRequested) elements.error.textContent = error.message;
+  } finally {
+    setEvaluationRunning(false);
+    renderEvaluationSelector();
+    renderEvaluationSummary();
+    if (!currentEvaluationTrialId) showNextUnjudgedTrial();
+  }
+}
+
+function stopEvaluation() {
+  if (!evaluationRunning) return;
+  evaluationCancelRequested = true;
+  elements.evalRunStatus.textContent = "Stopping after the current token…";
+  request("/api/stop", { method: "POST", body: "{}" }).catch(error => elements.error.textContent = error.message);
+}
+
+function evaluationMetricText(metrics) {
+  return `${metrics.tokenCount} tokens · ${metrics.wordCount} words · ${(metrics.uniqueWordRatio * 100).toFixed(0)}% unique words · ` +
+    `${(metrics.repeatedTrigramRatio * 100).toFixed(1)}% repeated trigrams`;
+}
+
+function resetEvaluationRubric() {
+  for (const element of [
+    elements.evalTaskLeft, elements.evalTaskRight, elements.evalCoherenceLeft, elements.evalCoherenceRight,
+    elements.evalStyleLeft, elements.evalStyleRight
+  ]) element.value = "";
+  for (const preference of document.querySelectorAll('input[name="evalPreference"]')) preference.checked = false;
+  elements.evalNotes.value = "";
+}
+
+function revealEvaluationTrial(experiment, trial) {
+  const leftKey = trial.leftIsA ? "A" : "B";
+  const rightKey = trial.leftIsA ? "B" : "A";
+  const leftName = leftKey === "A" ? experiment.nameA : experiment.nameB;
+  const rightName = rightKey === "A" ? experiment.nameA : experiment.nameB;
+  const leftMetrics = leftKey === "A" ? trial.metricsA : trial.metricsB;
+  const rightMetrics = rightKey === "A" ? trial.metricsA : trial.metricsB;
+  elements.evalLeftMetrics.textContent = evaluationMetricText(leftMetrics);
+  elements.evalRightMetrics.textContent = evaluationMetricText(rightMetrics);
+  elements.evalReveal.textContent =
+    `Revealed: left was ${leftName}; right was ${rightName}. Both used seed ${trial.seed} in isolated one-turn conversations.`;
+  elements.evalReveal.hidden = false;
+  elements.evalRubric.hidden = true;
+}
+
+function showEvaluationTrial(trial) {
+  const experiment = activeEvaluation();
+  if (!experiment || !trial) {
+    elements.evalJudge.hidden = true;
+    currentEvaluationTrialId = null;
+    return;
+  }
+  currentEvaluationTrialId = trial.id;
+  const trialIndex = experiment.trials.findIndex(candidate => candidate.id === trial.id);
+  elements.evalJudge.hidden = false;
+  elements.evalTrialLabel.textContent = `Blind trial ${trialIndex + 1} of ${experiment.trials.length}`;
+  elements.evalPromptDisplay.textContent = trial.prompt;
+  elements.evalLeftResponse.textContent = trial.leftIsA ? trial.responseA : trial.responseB;
+  elements.evalRightResponse.textContent = trial.leftIsA ? trial.responseB : trial.responseA;
+  elements.evalNext.disabled = !experiment.trials.some(candidate => !candidate.judgment && candidate.id !== trial.id);
+
+  if (trial.judgment) {
+    revealEvaluationTrial(experiment, trial);
+  } else {
+    resetEvaluationRubric();
+    elements.evalLeftMetrics.textContent = "Diagnostics reveal after judgment.";
+    elements.evalRightMetrics.textContent = "Diagnostics reveal after judgment.";
+    elements.evalReveal.hidden = true;
+    elements.evalRubric.hidden = false;
+  }
+}
+
+function showNextUnjudgedTrial() {
+  const experiment = activeEvaluation();
+  if (!experiment) {
+    showEvaluationTrial(null);
+    return;
+  }
+  const next = experiment.trials.find(trial => !trial.judgment && trial.id !== currentEvaluationTrialId) ||
+    experiment.trials.find(trial => !trial.judgment);
+  if (next) showEvaluationTrial(next);
+  else if (!currentEvaluationTrialId && experiment.trials.length) showEvaluationTrial(experiment.trials.at(-1));
+}
+
+function submitEvaluationJudgment() {
+  const experiment = activeEvaluation();
+  const trial = experiment?.trials.find(candidate => candidate.id === currentEvaluationTrialId);
+  if (!experiment || !trial || trial.judgment) return;
+
+  const preference = document.querySelector('input[name="evalPreference"]:checked')?.value;
+  const ratingElements = [
+    elements.evalTaskLeft, elements.evalTaskRight, elements.evalCoherenceLeft, elements.evalCoherenceRight,
+    elements.evalStyleLeft, elements.evalStyleRight
+  ];
+  if (!preference || ratingElements.some(element => !element.value)) {
+    elements.error.textContent = "Rate both responses on all three criteria and choose an overall preference.";
+    return;
+  }
+
+  const leftRatings = {
+    taskFit: Number(elements.evalTaskLeft.value),
+    coherence: Number(elements.evalCoherenceLeft.value),
+    style: Number(elements.evalStyleLeft.value)
+  };
+  const rightRatings = {
+    taskFit: Number(elements.evalTaskRight.value),
+    coherence: Number(elements.evalCoherenceRight.value),
+    style: Number(elements.evalStyleRight.value)
+  };
+  let preferred = "tie";
+  if (preference !== "tie") {
+    const preferredLeft = preference === "left";
+    preferred = preferredLeft === trial.leftIsA ? "A" : "B";
+  }
+  trial.judgment = {
+    preferred,
+    ratingsA: trial.leftIsA ? leftRatings : rightRatings,
+    ratingsB: trial.leftIsA ? rightRatings : leftRatings,
+    note: elements.evalNotes.value.trim(),
+    judgedAt: new Date().toISOString()
+  };
+  elements.error.textContent = "";
+  saveEvaluationStore();
+  revealEvaluationTrial(experiment, trial);
+  renderEvaluationSelector();
+  renderEvaluationSummary();
+  elements.evalNext.disabled = !experiment.trials.some(candidate => !candidate.judgment);
+}
+
+function average(values) {
+  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+}
+
+function exactSignTest(wins, losses) {
+  const count = wins + losses;
+  if (!count) return null;
+  const tail = Math.min(wins, losses);
+  let term = Math.pow(0.5, count);
+  let cumulative = term;
+  for (let index = 1; index <= tail; ++index) {
+    term *= (count - index + 1) / index;
+    cumulative += term;
+  }
+  return Math.min(1, 2 * cumulative);
+}
+
+function evaluationAggregate(experiment, key) {
+  const otherKey = key === "A" ? "B" : "A";
+  const judged = experiment.trials.filter(trial => trial.judgment);
+  const wins = judged.filter(trial => trial.judgment.preferred === key).length;
+  const losses = judged.filter(trial => trial.judgment.preferred === otherKey).length;
+  const ties = judged.filter(trial => trial.judgment.preferred === "tie").length;
+  const ratings = judged.map(trial => trial.judgment[`ratings${key}`]);
+  const metrics = experiment.trials.map(trial => trial[`metrics${key}`]);
+  return {
+    name: experiment[`name${key}`],
+    wins,
+    ties,
+    losses,
+    preference: judged.length ? (wins + ties * 0.5) / judged.length : null,
+    taskFit: average(ratings.map(rating => rating.taskFit)),
+    coherence: average(ratings.map(rating => rating.coherence)),
+    style: average(ratings.map(rating => rating.style)),
+    words: average(metrics.map(metric => metric.wordCount)),
+    repetition: average(metrics.map(metric => metric.repeatedTrigramRatio))
+  };
+}
+
+function appendEvaluationCell(row, text) {
+  const cell = document.createElement("td");
+  cell.textContent = text;
+  row.append(cell);
+}
+
+function renderEvaluationSummary() {
+  const experiment = activeEvaluation();
+  elements.evalSummaryBody.replaceChildren();
+  const hasExperiment = Boolean(experiment);
+  elements.evalExportJson.disabled = !hasExperiment;
+  elements.evalExportCsv.disabled = !hasExperiment;
+  elements.evalDelete.disabled = evaluationRunning || !hasExperiment;
+  if (!experiment) {
+    elements.evalSummary.textContent = "No completed judgments yet.";
+    return;
+  }
+
+  const judged = experiment.trials.filter(trial => trial.judgment);
+  const aggregateA = evaluationAggregate(experiment, "A");
+  const aggregateB = evaluationAggregate(experiment, "B");
+  for (const aggregate of [aggregateA, aggregateB]) {
+    const row = document.createElement("tr");
+    appendEvaluationCell(row, aggregate.name);
+    appendEvaluationCell(row, aggregate.preference === null ? "—" : `${(aggregate.preference * 100).toFixed(1)}%`);
+    appendEvaluationCell(row, `${aggregate.wins} / ${aggregate.ties} / ${aggregate.losses}`);
+    appendEvaluationCell(row, aggregate.taskFit === null ? "—" : aggregate.taskFit.toFixed(2));
+    appendEvaluationCell(row, aggregate.coherence === null ? "—" : aggregate.coherence.toFixed(2));
+    appendEvaluationCell(row, aggregate.style === null ? "—" : aggregate.style.toFixed(2));
+    appendEvaluationCell(row, aggregate.words === null ? "—" : aggregate.words.toFixed(1));
+    appendEvaluationCell(row, aggregate.repetition === null ? "—" : `${(aggregate.repetition * 100).toFixed(1)}%`);
+    elements.evalSummaryBody.append(row);
+  }
+
+  if (!judged.length) {
+    elements.evalSummary.textContent =
+      `${experiment.trials.length} generated ${experiment.trials.length === 1 ? "pair" : "pairs"}; judgments are still blind and pending.`;
+    return;
+  }
+  const winsA = judged.filter(trial => trial.judgment.preferred === "A").length;
+  const winsB = judged.filter(trial => trial.judgment.preferred === "B").length;
+  const ties = judged.length - winsA - winsB;
+  const pValue = exactSignTest(winsA, winsB);
+  const significance = pValue === null ? "no non-tied decisions yet" :
+    `two-sided exact sign-test p=${pValue < 0.001 ? "<0.001" : pValue.toFixed(3)} from ${winsA + winsB} non-tied decisions`;
+  elements.evalSummary.textContent =
+    `${judged.length}/${experiment.trials.length} judged · ${experiment.nameA} ${winsA} wins, ${experiment.nameB} ${winsB}, ${ties} ties · ${significance}.`;
+}
+
+function downloadEvaluation(filename, type, contents) {
+  const url = URL.createObjectURL(new Blob([contents], { type }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function exportEvaluationJson() {
+  const experiment = activeEvaluation();
+  if (!experiment) return;
+  downloadEvaluation(`logit-scope-evaluation-${experiment.id}.json`, "application/json", JSON.stringify(experiment, null, 2));
+}
+
+function csvCell(value) {
+  const text = value === null || value === undefined ? "" : typeof value === "string" ? value : JSON.stringify(value);
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function exportEvaluationCsv() {
+  const experiment = activeEvaluation();
+  if (!experiment) return;
+  const headings = [
+    "prompt", "seed", "generation_order", "left_is_a", "preferred", "name_a", "name_b", "settings_a", "settings_b",
+    "response_a", "response_b", "status_a", "status_b", "tokens_a", "tokens_b", "task_fit_a", "task_fit_b",
+    "coherence_a", "coherence_b", "style_a", "style_b", "words_a", "words_b", "unique_words_a", "unique_words_b",
+    "repeated_trigrams_a", "repeated_trigrams_b", "note"
+  ];
+  const rows = experiment.trials.map(trial => [
+    trial.prompt, trial.seed, trial.generationOrder, trial.leftIsA, trial.judgment?.preferred, experiment.nameA,
+    experiment.nameB, experiment.settingsA, experiment.settingsB, trial.responseA, trial.responseB, trial.statusA,
+    trial.statusB, trial.metricsA.tokenCount, trial.metricsB.tokenCount, trial.judgment?.ratingsA.taskFit,
+    trial.judgment?.ratingsB.taskFit, trial.judgment?.ratingsA.coherence, trial.judgment?.ratingsB.coherence,
+    trial.judgment?.ratingsA.style, trial.judgment?.ratingsB.style, trial.metricsA.wordCount, trial.metricsB.wordCount,
+    trial.metricsA.uniqueWordRatio, trial.metricsB.uniqueWordRatio, trial.metricsA.repeatedTrigramRatio,
+    trial.metricsB.repeatedTrigramRatio, trial.judgment?.note
+  ]);
+  const csv = [headings, ...rows].map(row => row.map(csvCell).join(",")).join("\r\n");
+  downloadEvaluation(`logit-scope-evaluation-${experiment.id}.csv`, "text/csv;charset=utf-8", csv);
+}
+
+function deleteActiveEvaluation() {
+  const experiment = activeEvaluation();
+  if (!experiment || evaluationRunning) return;
+  if (!window.confirm(`Delete the saved experiment “${experiment.nameA} vs ${experiment.nameB}”?`)) return;
+  evaluationStore.experiments = evaluationStore.experiments.filter(candidate => candidate.id !== experiment.id);
+  activeEvaluationId = evaluationStore.experiments.at(-1)?.id || null;
+  currentEvaluationTrialId = null;
+  saveEvaluationStore();
+  renderEvaluationSelector();
+  renderEvaluationSummary();
+  showNextUnjudgedTrial();
+}
+
 for (const element of [elements.profile, elements.seed, elements.protectControlTokens]) element.addEventListener("change", queueSettings);
 elements.diversity.addEventListener("input", queueSettings);
 elements.candidateCap.addEventListener("change", queueSettings);
@@ -384,8 +954,30 @@ elements.message.addEventListener("keydown", event => {
     sendMessage();
   }
 });
+for (const side of ["A", "B"]) {
+  evaluationField(side, "Profile").addEventListener("change", () => updateEvaluationConfigControls(side));
+}
+elements.evalUseCurrentA.addEventListener("click", () => useCurrentControlsForEvaluation("A"));
+elements.evalUseCurrentB.addEventListener("click", () => useCurrentControlsForEvaluation("B"));
+elements.evalStart.addEventListener("click", startEvaluation);
+elements.evalCancel.addEventListener("click", stopEvaluation);
+elements.evalSubmitJudgment.addEventListener("click", submitEvaluationJudgment);
+elements.evalNext.addEventListener("click", showNextUnjudgedTrial);
+elements.evalExperiment.addEventListener("change", () => {
+  activeEvaluationId = elements.evalExperiment.value || null;
+  currentEvaluationTrialId = null;
+  saveEvaluationStore();
+  renderEvaluationSummary();
+  showNextUnjudgedTrial();
+});
+elements.evalExportJson.addEventListener("click", exportEvaluationJson);
+elements.evalExportCsv.addEventListener("click", exportEvaluationCsv);
+elements.evalDelete.addEventListener("click", deleteActiveEvaluation);
 window.addEventListener("resize", drawPlot);
 
+renderEvaluationSelector();
+renderEvaluationSummary();
+showNextUnjudgedTrial();
 updateControlLabels();
 drawPlot();
 poll();
