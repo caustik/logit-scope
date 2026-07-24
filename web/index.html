@@ -22,6 +22,7 @@
         <span>Rank profile</span>
         <select id="profile">
           <option value="none">None</option>
+          <option value="temperature">Temperature</option>
           <option value="exponential">Exponential</option>
           <option value="soliton" selected>Soliton</option>
           <option value="power">Power</option>
@@ -30,9 +31,9 @@
       </label>
 
       <label class="slider-control">
-        <span>Diversity <output id="diversityValue">188% · 1.88× choices</output></span>
-        <input id="diversity" type="range" min="0" max="200" step="1" value="188" aria-label="Diversity from deterministic through raw to twice the model's effective choices">
-        <span class="range-scale" aria-hidden="true"><span>Deterministic</span><span>Raw</span><span>2× choices</span></span>
+        <span>Diversity <output id="diversityValue">188% · 1.88× alternatives</output></span>
+        <input id="diversity" type="range" min="0" max="200" step="1" value="188" aria-label="Diversity from deterministic through raw to twice the model's effective alternatives">
+        <span class="range-scale" aria-hidden="true"><span>Deterministic</span><span>Raw</span><span>2× alternatives</span></span>
       </label>
 
       <label>
@@ -66,7 +67,7 @@
         <span>Protocol guard</span>
       </label>
 
-      <p class="control-note">Above raw, the percentage is the effective-choice multiplier. Min-P removes low-confidence noise before rank shaping.</p>
+      <p class="control-note">Across the range, the percentage scales effective alternatives. Min-P removes low-confidence noise before rank shaping.</p>
     </section>
 
     <section class="scope panel">
@@ -129,6 +130,7 @@
                 <span>Profile</span>
                 <select id="evalProfileA">
                   <option value="none" selected>None</option>
+                  <option value="temperature">Temperature</option>
                   <option value="exponential">Exponential</option>
                   <option value="soliton">Soliton</option>
                   <option value="power">Power</option>
@@ -179,6 +181,7 @@
                 <span>Profile</span>
                 <select id="evalProfileB">
                   <option value="none">None</option>
+                  <option value="temperature">Temperature</option>
                   <option value="exponential">Exponential</option>
                   <option value="soliton" selected>Soliton</option>
                   <option value="power">Power</option>

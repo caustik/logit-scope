@@ -18,6 +18,8 @@ double rank_penalty(RankProfile profile, std::size_t rank)
     const auto rank_value = static_cast<double>(rank);
     switch (profile)
     {
+    case RankProfile::temperature:
+        return 0.0;
     case RankProfile::exponential:
         return rank_value;
     case RankProfile::soliton:
@@ -33,10 +35,19 @@ double rank_penalty(RankProfile profile, std::size_t rank)
     return 0.0;
 }
 
-double shaped_gap(double raw_gap, double profile_gap, double strength, bool loosen)
+double shaped_gap(RankProfile profile, double raw_gap, double profile_gap, double strength, bool loosen)
 {
+    if (profile == RankProfile::temperature)
+    {
+        const auto exponent = std::min(maximum_gap_exponent, strength);
+        return raw_gap * std::exp(loosen ? -exponent : exponent);
+    }
+
     if (!loosen) return raw_gap + strength * profile_gap;
-    const auto exponent = std::min(maximum_gap_exponent, strength * profile_gap);
+    if (raw_gap <= 0.0) return 0.0;
+    // This is a positive soft subtraction: its derivative at zero strength is -profile_gap,
+    // matching the additive sharpening path without erasing large raw-logit cliffs first.
+    const auto exponent = std::min(maximum_gap_exponent, strength * profile_gap / raw_gap);
     return raw_gap * std::exp(-exponent);
 }
 
@@ -54,7 +65,7 @@ float entropy_at_strength(const std::vector<float>& ranked_logits, RankProfile p
         {
             const auto raw_gap = std::max(0.0, static_cast<double>(ranked_logits[rank - 1]) - ranked_logits[rank]);
             const auto profile_gap = rank_penalty(profile, rank) - rank_penalty(profile, rank - 1);
-            shaped_logit -= shaped_gap(raw_gap, profile_gap, strength, loosen);
+            shaped_logit -= shaped_gap(profile, raw_gap, profile_gap, strength, loosen);
         }
         const auto normalized_logit = shaped_logit - maximum_logit;
         const auto weight = std::exp(normalized_logit);
@@ -74,6 +85,8 @@ const char* rank_profile_name(RankProfile profile)
     {
     case RankProfile::none:
         return "none";
+    case RankProfile::temperature:
+        return "temperature";
     case RankProfile::exponential:
         return "exponential";
     case RankProfile::soliton:
@@ -91,6 +104,11 @@ bool parse_rank_profile(std::string_view text, RankProfile& profile)
     if (text == "none")
     {
         profile = RankProfile::none;
+        return true;
+    }
+    if (text == "temperature")
+    {
+        profile = RankProfile::temperature;
         return true;
     }
     if (text == "exponential")
@@ -181,9 +199,11 @@ void shape_ranked_logits(std::vector<float>& ranked_logits, const ShapeSettings&
     probabilities_from_logits(ranked_logits, &raw_metrics);
     const auto maximum_entropy = static_cast<float>(std::log(static_cast<double>(ranked_logits.size())));
     const auto loosen = diversity > 1.0f;
-    const auto target_entropy =
-        loosen ? std::min(maximum_entropy, raw_metrics.entropy + static_cast<float>(std::log(static_cast<double>(diversity))))
-               : raw_metrics.entropy * diversity;
+    const auto raw_effective_choices = std::exp(static_cast<double>(raw_metrics.entropy));
+    // Scale only choices beyond the deterministic leading choice so confident decisions stay confident.
+    const auto target_effective_choices =
+        std::min(static_cast<double>(ranked_logits.size()), 1.0 + diversity * std::max(0.0, raw_effective_choices - 1.0));
+    const auto target_entropy = static_cast<float>(std::log(target_effective_choices));
     if (target_entropy >= maximum_entropy)
     {
         std::fill(ranked_logits.begin() + 1, ranked_logits.end(), ranked_logits.front());
@@ -216,7 +236,7 @@ void shape_ranked_logits(std::vector<float>& ranked_logits, const ShapeSettings&
         const auto raw_logit = ranked_logits[rank];
         const auto raw_gap = std::max(0.0, static_cast<double>(previous_raw_logit) - raw_logit);
         const auto profile_gap = rank_penalty(settings.profile, rank) - rank_penalty(settings.profile, rank - 1);
-        shaped_logit -= shaped_gap(raw_gap, profile_gap, strength, loosen);
+        shaped_logit -= shaped_gap(settings.profile, raw_gap, profile_gap, strength, loosen);
         ranked_logits[rank] = static_cast<float>(std::max(static_cast<double>(std::numeric_limits<float>::lowest()), shaped_logit));
         previous_raw_logit = raw_logit;
     }

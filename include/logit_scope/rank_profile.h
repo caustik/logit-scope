@@ -14,6 +14,7 @@ constexpr std::size_t maximum_candidate_cap = 4096;
 enum class RankProfile
 {
     none,
+    temperature,
     exponential,
     soliton,
     power,

@@ -10,8 +10,8 @@ The project is a small C++ application built directly on [llama.cpp](https://git
 
 ## What you can manipulate
 
-- **Profile:** no shaping, or an exponential, soliton, power, or half-normal response across adjacent ranked-logit gaps
-- **Diversity:** moves from deterministic sampling at 0%, through unchanged sampling at 100%, to twice the model's effective choices at 200%, subject to the candidate policy and protocol guard
+- **Profile:** no shaping, a slope-preserving temperature baseline, or an exponential, soliton, power, or half-normal response across adjacent ranked-logit gaps
+- **Diversity:** scales the model's effective alternatives from none at 0%, through unchanged sampling at 100%, to twice as many at 200%, subject to the candidate policy and protocol guard
 - **Candidate cap:** limits sampling to at most the top 32–4096 candidates
 - **Min-P floor:** removes candidates whose raw probability is too small relative to the leading candidate; the default is 1% of the peak
 - **Seed:** initializes the random sampler for the next response
@@ -21,7 +21,7 @@ The default personality is **Soliton** at **188% diversity**, with a **64-candid
 
 Profile, diversity, candidate-policy, and protocol-guard changes take effect on the next sampled token, including during a response. Seed changes take effect when the next response starts.
 
-![Exploring diversity around the default Soliton personality](docs/images/logit-scope-demo.gif)
+![Exploring effective alternatives around the default Soliton personality](docs/images/logit-scope-demo.gif)
 
 ## Blind evaluation lab
 
@@ -113,22 +113,25 @@ half-normal:  f(r) = r²
 
 w(r) = f(r) - f(r - 1)
 sharpen: g'(r) = g(r) + s w(r)
-loosen:  g'(r) = g(r) exp(-s w(r))
+loosen:  g'(r) = g(r) exp(-s w(r) / g(r))
 ```
 
-The shaped logits are reconstructed from `l'(0) = l(0)` and those gaps. Positive raw gaps therefore stay positive at every finite loosening strength: shaping cannot make a lower-ranked token overtake a higher-ranked one, and it no longer creates a broad equal-logit plateau as a side effect of clamping. With the **Exponential** profile, `w(r) = 1`, so loosening scales every adjacent gap by the same amount, similar to temperature but calibrated to a directly interpretable entropy target.
+The loosen formula applies when `g(r) > 0`; an existing zero gap remains zero. It is a rank-safe soft version of subtracting `s w(r)`: near zero strength its first-order response is `g(r) - s w(r)`, matching sharpening in the opposite direction, while every positive gap stays positive at finite strength. Large raw-logit cliffs soften later than clusters of close alternatives, and a distribution already in the selected profile family stays in that family as its concentration changes. The shaped logits are reconstructed from `l'(0) = l(0)`, so a lower-ranked token cannot overtake a higher-ranked one.
+
+The **Temperature** baseline instead multiplies every raw gap by the same calibrated factor. It is the familiar slope-preserving logit-temperature transform and provides a control for determining whether a rank profile adds value beyond entropy-matched temperature.
 
 The **Soliton** profile takes the descending half of the canonical `sech²` [Korteweg–de Vries solitary-wave pulse](https://gfd.whoi.edu/wp-content/uploads/sites/18/2018/03/NLW1-Intro_52126.pdf) and uses its negative log as a rank penalty. It borrows that envelope as a smooth weighting curve; the sampler does not solve a wave equation. The result has a rounded shoulder across the highest-ranked candidates and approaches exponential suppression in the tail.
 
-The profile strength `s` is not exposed as a control. Instead, the shared calibrator solves for it on every token. Below 100%, diversity scales the raw entropy toward zero. Above 100%, diversity multiplies the distribution's effective number of choices, `exp(H)`, until the selected pool's finite maximum is reached:
+The profile strength `s` is not exposed as a control. Instead, the shared calibrator solves for it on every token. Diversity operates on effective alternatives: the entropy-derived effective choice count minus the one leading choice that is present even in a deterministic distribution.
 
 ```text
-0% ≤ diversity ≤ 100%: shaped entropy = D × raw entropy
-100% < diversity ≤ 200%: shaped entropy = min(log(K), raw entropy + log(D))
-effective choices = exp(entropy)
+raw effective choices = exp(H)
+raw effective alternatives = exp(H) - 1
+target effective choices = min(K, 1 + D × (exp(H) - 1))
+target entropy = log(target effective choices)
 ```
 
-Below 100%, the profile removes probability from lower ranks. Above 100%, it returns probability toward lower ranks while preserving the model's candidate order. For example, 105% requests only 1.05 times the raw effective choices, while 200% requests twice as many. The previous distance-to-uniform interpretation made even a small move above 100% pull in proportion to `log(K)`; with a large fixed pool, that could flatten many implausible tail tokens and sharply destabilize generation. The effective-choice interpretation is independent of unused pool capacity and reaches uniform only when doubling the raw effective choices would already exhaust the selected pool.
+Below 100%, the profile removes probability from lower ranks. Above 100%, it returns probability toward lower ranks while preserving the model's candidate order. Scaling alternatives instead of total choices keeps low-entropy decisions stable: a nearly certain token does not gain a whole fabricated alternative merely because diversity is above 100%. At higher raw entropy the interpretation approaches an ordinary choice multiplier; 200% produces `2 exp(H) - 1` effective choices unless the selected pool is exhausted. The mapping is continuous through the raw distribution and independent of unused pool capacity.
 
 This keeps profile experiments small: a new profile supplies one rank curve, while the common bidirectional calibration and UI contract remain unchanged. The **None** profile is an exact shaping bypass, and 100% diversity is also an exact shaping bypass. The Min-P floor and candidate cap are a separate candidate policy and still apply in either bypass mode.
 

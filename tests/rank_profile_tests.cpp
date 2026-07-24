@@ -33,6 +33,26 @@ logit_scope::ProbabilityMetrics probability_metrics(const std::vector<float>& lo
     return metrics;
 }
 
+double profile_penalty(logit_scope::RankProfile profile, std::size_t rank)
+{
+    const auto rank_value = static_cast<double>(rank);
+    switch (profile)
+    {
+    case logit_scope::RankProfile::exponential:
+        return rank_value;
+    case logit_scope::RankProfile::soliton:
+        return 2.0 * (rank_value + std::log1p(std::exp(-2.0 * rank_value)) - std::log(2.0));
+    case logit_scope::RankProfile::power:
+        return std::log(rank_value + 1.0);
+    case logit_scope::RankProfile::half_normal:
+        return rank_value * rank_value;
+    case logit_scope::RankProfile::none:
+    case logit_scope::RankProfile::temperature:
+        return 0.0;
+    }
+    return 0.0;
+}
+
 } // namespace
 
 int main()
@@ -61,7 +81,8 @@ int main()
     apply_relative_probability_floor(floor_bypass, 0.0f);
     require(floor_bypass.size() == 4, "zero Min-P floor must be an exact bypass");
 
-    for (const auto profile : {RankProfile::exponential, RankProfile::soliton, RankProfile::power, RankProfile::half_normal})
+    for (const auto profile :
+         {RankProfile::temperature, RankProfile::exponential, RankProfile::soliton, RankProfile::power, RankProfile::half_normal})
     {
         ShapeSettings identity_settings;
         identity_settings.profile = profile;
@@ -97,9 +118,10 @@ int main()
                 shape_ranked_logits(logits, shaped_settings);
 
                 const auto shaped_metrics = probability_metrics(logits);
-                const auto maximum_entropy = std::log(static_cast<float>(candidate_count));
-                const auto expected_entropy = diversity < 1.0f ? raw_metrics.entropy * diversity
-                                                               : std::min(maximum_entropy, raw_metrics.entropy + std::log(diversity));
+                const auto raw_effective_choices = std::exp(raw_metrics.entropy);
+                const auto expected_effective_choices =
+                    std::min(static_cast<float>(candidate_count), 1.0f + diversity * (raw_effective_choices - 1.0f));
+                const auto expected_entropy = std::log(expected_effective_choices);
                 if (!close(shaped_metrics.entropy, expected_entropy, 5.0e-4f))
                     std::cerr << "entropy mismatch: profile=" << rank_profile_name(profile) << " pool=" << candidate_count
                               << " diversity=" << diversity << " actual=" << shaped_metrics.entropy << " expected=" << expected_entropy
@@ -138,18 +160,70 @@ int main()
     }
 
     ShapeSettings temperature_settings;
-    temperature_settings.profile = RankProfile::exponential;
-    temperature_settings.diversity = 1.5f;
+    temperature_settings.profile = RankProfile::temperature;
     const std::vector<float> temperature_raw{5.0f, 3.0f, 0.0f, -4.0f, -9.0f};
-    auto temperature_shaped = temperature_raw;
-    shape_ranked_logits(temperature_shaped, temperature_settings);
-    const auto first_gap_ratio = (temperature_shaped[0] - temperature_shaped[1]) / (temperature_raw[0] - temperature_raw[1]);
-    for (std::size_t rank = 2; rank < temperature_raw.size(); ++rank)
+    for (const auto diversity : {0.75f, 1.5f})
     {
-        const auto raw_gap = temperature_raw[rank - 1] - temperature_raw[rank];
-        const auto shaped_gap = temperature_shaped[rank - 1] - temperature_shaped[rank];
-        require(close(shaped_gap / raw_gap, first_gap_ratio, 1.0e-4f), "exponential profile must scale every adjacent logit gap equally");
+        temperature_settings.diversity = diversity;
+        auto temperature_shaped = temperature_raw;
+        shape_ranked_logits(temperature_shaped, temperature_settings);
+        const auto first_gap_ratio = (temperature_shaped[0] - temperature_shaped[1]) / (temperature_raw[0] - temperature_raw[1]);
+        for (std::size_t rank = 2; rank < temperature_raw.size(); ++rank)
+        {
+            const auto raw_gap = temperature_raw[rank - 1] - temperature_raw[rank];
+            const auto shaped_gap = temperature_shaped[rank - 1] - temperature_shaped[rank];
+            require(close(shaped_gap / raw_gap, first_gap_ratio, 1.0e-4f),
+                    "temperature profile must scale every adjacent logit gap equally");
+        }
     }
+
+    for (const auto profile : {RankProfile::exponential, RankProfile::soliton, RankProfile::power, RankProfile::half_normal})
+    {
+        std::vector<float> family_logits(16);
+        for (std::size_t rank = 0; rank < family_logits.size(); ++rank)
+            family_logits[rank] = static_cast<float>(3.0 - 0.7 * profile_penalty(profile, rank));
+
+        for (const auto diversity : {0.6f, 1.6f})
+        {
+            ShapeSettings family_settings;
+            family_settings.profile = profile;
+            family_settings.diversity = diversity;
+            auto family_shaped = family_logits;
+            shape_ranked_logits(family_shaped, family_settings);
+
+            const auto shaped_concentration = (static_cast<double>(family_shaped.front()) - family_shaped[1]) / profile_penalty(profile, 1);
+            for (std::size_t rank = 2; rank < family_shaped.size(); ++rank)
+            {
+                const auto concentration =
+                    (static_cast<double>(family_shaped.front()) - family_shaped[rank]) / profile_penalty(profile, rank);
+                require(std::abs(concentration - shaped_concentration) < 2.0e-4,
+                        "shaping a profile-family distribution must preserve that profile family");
+            }
+        }
+    }
+
+    ShapeSettings cliff_settings;
+    cliff_settings.profile = RankProfile::exponential;
+    cliff_settings.diversity = 1.5f;
+    const std::vector<float> cliff_raw{0.0f, -0.1f, -3.1f};
+    auto cliff_shaped = cliff_raw;
+    shape_ranked_logits(cliff_shaped, cliff_settings);
+    const auto small_gap_ratio = (cliff_shaped[0] - cliff_shaped[1]) / (cliff_raw[0] - cliff_raw[1]);
+    const auto large_gap_ratio = (cliff_shaped[1] - cliff_shaped[2]) / (cliff_raw[1] - cliff_raw[2]);
+    require(small_gap_ratio < large_gap_ratio, "loosening must soften close alternatives before crossing a large raw-logit cliff");
+
+    ShapeSettings alternatives_settings;
+    alternatives_settings.profile = RankProfile::exponential;
+    alternatives_settings.diversity = 2.0f;
+    const std::vector<float> low_entropy_raw{0.0f, -5.0f, -6.0f, -7.0f};
+    auto alternatives_shaped = low_entropy_raw;
+    shape_ranked_logits(alternatives_shaped, alternatives_settings);
+    const auto low_entropy_raw_metrics = probability_metrics(low_entropy_raw);
+    const auto alternatives_shaped_metrics = probability_metrics(alternatives_shaped);
+    const auto raw_effective_choices = std::exp(low_entropy_raw_metrics.entropy);
+    const auto shaped_effective_choices = std::exp(alternatives_shaped_metrics.entropy);
+    require(close(shaped_effective_choices, 1.0f + 2.0f * (raw_effective_choices - 1.0f), 5.0e-4f),
+            "diversity must scale effective alternatives rather than inventing a full choice at low entropy");
 
     ShapeSettings soliton_settings;
     soliton_settings.profile = RankProfile::soliton;
@@ -170,6 +244,7 @@ int main()
 
     RankProfile parsed{};
     require(parse_rank_profile("none", parsed) && parsed == RankProfile::none, "none profile parsing");
+    require(parse_rank_profile("temperature", parsed) && parsed == RankProfile::temperature, "temperature profile parsing");
     require(parse_rank_profile("soliton", parsed) && parsed == RankProfile::soliton, "soliton profile parsing");
     require(parse_rank_profile("half-normal", parsed) && parsed == RankProfile::half_normal, "profile parsing");
     require(!parse_rank_profile("uniform", parsed), "uniform profile rejection");

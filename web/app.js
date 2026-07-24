@@ -60,8 +60,7 @@ function updateControlLabels() {
 
 function diversityMode(diversity) {
   if (diversity === 0) return "deterministic";
-  if (diversity < 1) return "sharpen";
-  if (diversity > 1) return `${diversity.toFixed(2)}× choices`;
+  if (diversity !== 1) return `${diversity.toFixed(2)}× alternatives`;
   return "raw";
 }
 
@@ -423,6 +422,7 @@ function saveEvaluationStore() {
 function profileDisplayName(profile) {
   return {
     none: "None",
+    temperature: "Temperature",
     exponential: "Exponential",
     soliton: "Soliton",
     power: "Power",
