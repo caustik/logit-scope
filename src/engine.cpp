@@ -2,22 +2,22 @@
 
 #include <llama.h>
 
-#include <algorithm>
-#include <atomic>
-#include <cctype>
-#include <cmath>
 #include <condition_variable>
-#include <cstdint>
-#include <deque>
+#include <string_view>
 #include <filesystem>
 #include <functional>
+#include <algorithm>
 #include <iostream>
-#include <limits>
-#include <mutex>
-#include <string_view>
-#include <thread>
+#include <cstdint>
 #include <utility>
+#include <atomic>
+#include <cctype>
+#include <limits>
+#include <thread>
 #include <vector>
+#include <cmath>
+#include <deque>
+#include <mutex>
 
 namespace logit_scope
 {
@@ -173,7 +173,8 @@ class Engine::Impl
         ShapeSettings settings;
         settings.profile = static_cast<RankProfile>(settings_profile_.load());
         settings.diversity = settings_diversity_.load();
-        settings.candidate_count = settings_candidate_count_.load();
+        settings.candidate_cap = settings_candidate_cap_.load();
+        settings.minimum_relative_probability = settings_minimum_relative_probability_.load();
         settings.seed = settings_seed_.load();
         settings.protect_control_tokens = settings_protect_control_.load();
         return settings;
@@ -181,10 +182,11 @@ class Engine::Impl
 
     void set_shape_settings(const ShapeSettings& settings)
     {
-        const auto candidate_count = std::max<std::size_t>(2, std::min<std::size_t>(4096, settings.candidate_count));
+        const auto candidate_cap = std::max<std::size_t>(2, std::min(maximum_candidate_cap, settings.candidate_cap));
         settings_profile_.store(static_cast<int>(settings.profile));
-        settings_diversity_.store(std::max(0.0f, std::min(2.0f, settings.diversity)));
-        settings_candidate_count_.store(candidate_count);
+        settings_diversity_.store(std::max(0.0f, std::min(maximum_diversity, settings.diversity)));
+        settings_candidate_cap_.store(candidate_cap);
+        settings_minimum_relative_probability_.store(std::max(0.0f, std::min(1.0f, settings.minimum_relative_probability)));
         settings_seed_.store(settings.seed);
         settings_protect_control_.store(settings.protect_control_tokens);
     }
@@ -199,15 +201,16 @@ class Engine::Impl
     {
         const std::lock_guard lock(preview_mutex_);
         if (preview_valid_ && settings.profile == preview_settings_.profile && settings.diversity == preview_settings_.diversity &&
-            settings.candidate_count == preview_settings_.candidate_count)
+            settings.candidate_cap == preview_settings_.candidate_cap &&
+            settings.minimum_relative_probability == preview_settings_.minimum_relative_probability)
             return preview_snapshot_;
 
         SamplingSnapshot preview;
-        preview.candidate_count = std::max<std::size_t>(2, std::min<std::size_t>(4096, settings.candidate_count));
-
-        std::vector<float> raw_logits(preview.candidate_count);
+        std::vector<float> raw_logits(std::max<std::size_t>(2, std::min(maximum_candidate_cap, settings.candidate_cap)));
         for (std::size_t rank = 0; rank < raw_logits.size(); ++rank)
             raw_logits[rank] = static_cast<float>(-1.2 * std::log(static_cast<double>(rank) + 1.0));
+        apply_relative_probability_floor(raw_logits, settings.minimum_relative_probability);
+        preview.candidate_count = raw_logits.size();
         auto shaped_logits = raw_logits;
         shape_ranked_logits(shaped_logits, settings);
 
@@ -645,18 +648,38 @@ class Engine::Impl
             return left_logit == right_logit ? left < right : left_logit > right_logit;
         };
 
-        const auto shape_count = std::min(settings.candidate_count, ordered_indices.size());
-        if (shape_count == 0) return;
-        std::partial_sort(ordered_indices.begin(), ordered_indices.begin() + static_cast<std::ptrdiff_t>(shape_count),
+        const auto candidate_cap = std::min(settings.candidate_cap, ordered_indices.size());
+        if (candidate_cap == 0) return;
+        std::partial_sort(ordered_indices.begin(), ordered_indices.begin() + static_cast<std::ptrdiff_t>(candidate_cap),
                           ordered_indices.end(), compare_logits);
 
-        std::vector<float> raw_logits(shape_count);
-        std::vector<llama_token_data> selected_candidates(shape_count);
-        for (std::size_t rank = 0; rank < shape_count; ++rank)
+        std::vector<float> raw_logits(candidate_cap);
+        std::vector<llama_token_data> selected_candidates(candidate_cap);
+        for (std::size_t rank = 0; rank < candidate_cap; ++rank)
         {
             raw_logits[rank] = candidates->data[ordered_indices[rank]].logit;
             selected_candidates[rank] = candidates->data[ordered_indices[rank]];
         }
+
+        if (settings.minimum_relative_probability > 0.0f)
+        {
+            const auto minimum_logit =
+                raw_logits.front() + static_cast<float>(std::log(static_cast<double>(settings.minimum_relative_probability)));
+            auto retained_count = std::size_t{};
+            for (std::size_t rank = 0; rank < candidate_cap; ++rank)
+            {
+                const auto token = selected_candidates[rank].id;
+                const auto protected_token = settings.protect_control_tokens && vocab_ != nullptr &&
+                                             (llama_vocab_is_control(vocab_, token) || llama_vocab_is_eog(vocab_, token));
+                if (raw_logits[rank] < minimum_logit && !protected_token) continue;
+                raw_logits[retained_count] = raw_logits[rank];
+                selected_candidates[retained_count] = selected_candidates[rank];
+                ++retained_count;
+            }
+            raw_logits.resize(retained_count);
+            selected_candidates.resize(retained_count);
+        }
+        const auto shape_count = raw_logits.size();
 
         auto shaped_logits = raw_logits;
         shape_ranked_logits(shaped_logits, settings);
@@ -737,7 +760,8 @@ class Engine::Impl
         const auto settings_match =
             representative_sampling_.valid && pending_sampling_.settings.profile == representative_sampling_.settings.profile &&
             pending_sampling_.settings.diversity == representative_sampling_.settings.diversity &&
-            pending_sampling_.settings.candidate_count == representative_sampling_.settings.candidate_count &&
+            pending_sampling_.settings.candidate_cap == representative_sampling_.settings.candidate_cap &&
+            pending_sampling_.settings.minimum_relative_probability == representative_sampling_.settings.minimum_relative_probability &&
             pending_sampling_.settings.seed == representative_sampling_.settings.seed &&
             pending_sampling_.settings.protect_control_tokens == representative_sampling_.settings.protect_control_tokens;
         if (!settings_match || pending_sampling_.raw_entropy > representative_sampling_.raw_entropy)
@@ -753,6 +777,7 @@ class Engine::Impl
     static void copy_sampling_data(const PendingSamplingData& source, SamplingSnapshot& destination)
     {
         destination.selected_token = source.selected_token;
+        destination.sampling_settings = source.settings;
         destination.candidate_count = source.candidate_count;
         destination.probability_count = source.probability_count;
         destination.probability_ranks = source.probability_ranks;
@@ -855,7 +880,8 @@ class Engine::Impl
     EngineConfig config_;
     std::atomic<int> settings_profile_{static_cast<int>(ShapeSettings{}.profile)};
     std::atomic<float> settings_diversity_{ShapeSettings{}.diversity};
-    std::atomic<std::size_t> settings_candidate_count_{ShapeSettings{}.candidate_count};
+    std::atomic<std::size_t> settings_candidate_cap_{ShapeSettings{}.candidate_cap};
+    std::atomic<float> settings_minimum_relative_probability_{ShapeSettings{}.minimum_relative_probability};
     std::atomic<std::uint32_t> settings_seed_{ShapeSettings{}.seed};
     std::atomic<bool> settings_protect_control_{ShapeSettings{}.protect_control_tokens};
 

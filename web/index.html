@@ -12,7 +12,7 @@
     <header class="title-row">
       <div>
         <h1>Logit Scope</h1>
-        <p>Shape sampling probability by candidate rank while the model speaks.</p>
+        <p>Shape ranked logit gaps while the model speaks.</p>
       </div>
       <div id="connection" class="connection">Connecting</div>
     </header>
@@ -23,23 +23,36 @@
         <select id="profile">
           <option value="none">None</option>
           <option value="exponential">Exponential</option>
-          <option value="soliton">Soliton</option>
-          <option value="power" selected>Power</option>
+          <option value="soliton" selected>Soliton</option>
+          <option value="power">Power</option>
           <option value="half-normal">Half-normal</option>
         </select>
       </label>
 
       <label class="slider-control">
-        <span>Diversity <output id="diversityValue">100% · raw</output></span>
-        <input id="diversity" type="range" min="0" max="200" step="1" value="100" aria-label="Diversity from deterministic through raw to uniform sampling">
-        <span class="range-scale" aria-hidden="true"><span>Deterministic</span><span>Raw</span><span>Uniform</span></span>
+        <span>Diversity <output id="diversityValue">188% · 1.88× choices</output></span>
+        <input id="diversity" type="range" min="0" max="200" step="1" value="188" aria-label="Diversity from deterministic through raw to twice the model's effective choices">
+        <span class="range-scale" aria-hidden="true"><span>Deterministic</span><span>Raw</span><span>2× choices</span></span>
       </label>
 
       <label>
-        <span>Pool</span>
-        <select id="candidateCount">
-          <option>32</option><option>64</option><option>128</option><option>256</option>
-          <option>512</option><option>1024</option><option>2048</option><option selected>4096</option>
+        <span>Candidate cap</span>
+        <select id="candidateCap">
+          <option>32</option><option selected>64</option><option>128</option><option>256</option>
+          <option>512</option><option>1024</option><option>2048</option><option>4096</option>
+        </select>
+      </label>
+
+      <label title="Discard ordinary candidates whose raw probability is below this fraction of the peak candidate">
+        <span>Min-P floor</span>
+        <select id="minimumRelativeProbability">
+          <option value="0">Off</option>
+          <option value="0.001">0.1% of peak</option>
+          <option value="0.005">0.5% of peak</option>
+          <option value="0.01" selected>1% of peak</option>
+          <option value="0.02">2% of peak</option>
+          <option value="0.05">5% of peak</option>
+          <option value="0.1">10% of peak</option>
         </select>
       </label>
 
@@ -52,6 +65,8 @@
         <input id="protectControlTokens" type="checkbox" checked>
         <span>Protocol guard</span>
       </label>
+
+      <p class="control-note">Above raw, the percentage is the effective-choice multiplier. Min-P removes low-confidence noise before rank shaping.</p>
     </section>
 
     <section class="scope panel">
@@ -65,7 +80,7 @@
           <span id="shapedLegend" class="shaped">Shaped</span>
         </div>
       </div>
-      <canvas id="plot" aria-label="Per-rank probability plot across the full candidate pool on a logarithmic rank axis"></canvas>
+      <canvas id="plot" aria-label="Per-rank probability plot on a fixed candidate-cap axis; curves end at the count retained after Min-P"></canvas>
       <div class="metrics">
         <div><span>Pool mass</span><strong id="poolMass">—</strong></div>
         <div><span>JS shift</span><strong id="jsShift">—</strong></div>

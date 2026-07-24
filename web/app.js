@@ -1,5 +1,5 @@
 const elements = Object.fromEntries([
-  "connection", "profile", "diversity", "diversityValue", "candidateCount", "seed",
+  "connection", "profile", "diversity", "diversityValue", "candidateCap", "minimumRelativeProbability", "seed",
   "protectControlTokens", "plot", "scopeCaption", "shapedLegend", "poolMass",
   "jsShift", "effectiveChoices", "peak", "selectedTokenLabel", "selectedToken", "transcript", "message", "clear", "stop",
   "send", "status", "error"
@@ -30,7 +30,8 @@ function currentSettings() {
   return {
     profile: elements.profile.value,
     diversity: Number(elements.diversity.value) / 100,
-    candidateCount: Number(elements.candidateCount.value),
+    candidateCap: Number(elements.candidateCap.value),
+    minimumRelativeProbability: Number(elements.minimumRelativeProbability.value),
     seed: Number(elements.seed.value),
     protectControlTokens: elements.protectControlTokens.checked
   };
@@ -45,9 +46,8 @@ function updateControlLabels() {
 
 function diversityMode(diversity) {
   if (diversity === 0) return "deterministic";
-  if (diversity === 2) return "uniform";
   if (diversity < 1) return "sharpen";
-  if (diversity > 1) return "loosen";
+  if (diversity > 1) return `${diversity.toFixed(2)}× choices`;
   return "raw";
 }
 
@@ -82,7 +82,11 @@ async function flushSettings() {
 
 function initializeControls(settings) {
   elements.profile.value = settings.profile;
-  elements.candidateCount.value = String(settings.candidateCount);
+  elements.candidateCap.value = String(settings.candidateCap);
+  const requestedFloor = Number(settings.minimumRelativeProbability);
+  const nearestFloorOption = Array.from(elements.minimumRelativeProbability.options).reduce((nearest, option) =>
+    Math.abs(Number(option.value) - requestedFloor) < Math.abs(Number(nearest.value) - requestedFloor) ? option : nearest);
+  elements.minimumRelativeProbability.value = nearestFloorOption.value;
   elements.diversity.value = Math.round(settings.diversity * 100);
   elements.seed.value = settings.seed;
   elements.protectControlTokens.checked = settings.protectControlTokens;
@@ -91,7 +95,8 @@ function initializeControls(settings) {
 }
 
 function displayRanks(candidateCount, maximumCount = maximumDisplayPointCount) {
-  const count = Math.max(2, candidateCount);
+  const count = Math.max(1, candidateCount);
+  if (count === 1) return [0];
   const displayCount = Math.min(maximumCount, count);
   if (count <= displayCount) return Array.from({ length: count }, (_, rank) => rank);
 
@@ -111,17 +116,25 @@ function sampledProbabilities(values, ranks) {
 }
 
 function hasCurrentSamplingData(settings, next = snapshot) {
-  return Boolean(next?.samplingStep) && next.samplingStep !== staleSamplingStep && next.candidateCount === settings.candidateCount;
+  return Boolean(next?.samplingStep) && next.samplingStep !== staleSamplingStep &&
+    next.candidateCount > 0 && next.candidateCount <= settings.candidateCap;
 }
 
 function settingsMatch(left, right) {
   return left?.profile === right.profile &&
     Math.abs(left.diversity - right.diversity) < 0.0001 &&
-    left.candidateCount === right.candidateCount;
+    left.candidateCap === right.candidateCap &&
+    Math.abs(left.minimumRelativeProbability - right.minimumRelativeProbability) < 0.000001;
+}
+
+function samplingSettingsMatch(left, right) {
+  return settingsMatch(left, right) &&
+    left.seed === right.seed &&
+    left.protectControlTokens === right.protectControlTokens;
 }
 
 function samplingView(settings, next = snapshot) {
-  if (hasCurrentSamplingData(settings, next)) {
+  if (hasCurrentSamplingData(settings, next) && samplingSettingsMatch(next.samplingSettings, settings)) {
     return {
       data: next,
       preview: false,
@@ -130,7 +143,8 @@ function samplingView(settings, next = snapshot) {
       selectedToken: next.selectedToken
     };
   }
-  if (next?.preview && settingsMatch(next.settings, settings) && next.preview.candidateCount === settings.candidateCount) {
+  if (next?.preview && settingsMatch(next.settings, settings) &&
+      next.preview.candidateCount > 0 && next.preview.candidateCount <= settings.candidateCap) {
     return { data: next.preview, preview: true, settings: next.settings };
   }
   return null;
@@ -140,6 +154,17 @@ function stableSamplingView(settings, next = snapshot) {
   const currentView = samplingView(settings, next);
   if (currentView) displayedSamplingView = currentView;
   return { current: Boolean(currentView), view: currentView || displayedSamplingView };
+}
+
+function probabilityExponentRange(probabilities, fitToData) {
+  if (!fitToData || !probabilities.length) return { maximum: 0, minimum: -6 };
+
+  const maximum = Math.min(0, Math.ceil(Math.log10(Math.max(...probabilities))));
+  const dataMinimum = Math.floor(Math.log10(Math.min(...probabilities)));
+  return {
+    maximum,
+    minimum: Math.max(maximum - 6, Math.min(maximum - 2, dataMinimum))
+  };
 }
 
 function drawPlot() {
@@ -168,15 +193,17 @@ function drawPlot() {
   const plotSettings = view?.settings || settings;
   const shapingActive = plotSettings.profile !== "none" && plotSettings.diversity !== 1;
   elements.shapedLegend.hidden = !shapingActive;
-  const candidateCount = Math.max(2, view?.data.candidateCount || plotSettings.candidateCount);
+  const candidateCount = Math.max(1, view?.data.candidateCount || plotSettings.candidateCap);
+  const rankDomainCount = Math.max(2, plotSettings.candidateCap);
+  const rankDenominator = Math.log(rankDomainCount);
   const probabilityRanks = view?.data.probabilityRanks || [];
   const raw = sampledProbabilities(view?.data.rawProbabilities || [], probabilityRanks);
   const shaped = sampledProbabilities(view?.data.shapedProbabilities || [], probabilityRanks);
   const plottedProbabilities = [...raw, ...shaped].map(point => point.value).filter(value => value > 0);
-  const peakProbability = plottedProbabilities.length ? Math.max(...plottedProbabilities) : 1;
-  const maximumExponent = Math.min(0, Math.ceil(Math.log10(peakProbability)));
-  const minimumExponent = maximumExponent - 6;
-  const x = rank => margin.left + (Math.log1p(rank) / Math.log(candidateCount)) * plotWidth;
+  const exponentRange = probabilityExponentRange(plottedProbabilities, Boolean(view?.preview));
+  const maximumExponent = exponentRange.maximum;
+  const minimumExponent = exponentRange.minimum;
+  const x = rank => margin.left + (Math.log1p(rank) / rankDenominator) * plotWidth;
   const y = probability => {
     const exponent = Math.log10(Math.max(Math.pow(10, minimumExponent), probability));
     return margin.top + ((maximumExponent - exponent) / (maximumExponent - minimumExponent)) * plotHeight;
@@ -200,10 +227,10 @@ function drawPlot() {
     context.fillText(label, 7, axisY);
   }
 
-  const axisRanks = displayRanks(candidateCount, 5);
+  const axisRanks = displayRanks(rankDomainCount, 5);
   for (const rank of axisRanks) {
     const axisX = x(rank);
-    context.strokeStyle = rank === 0 || rank === candidateCount - 1 ? "#45515e" : "#27313a";
+    context.strokeStyle = rank === 0 || rank === rankDomainCount - 1 ? "#45515e" : "#27313a";
     context.lineWidth = 1;
     context.beginPath();
     context.moveTo(axisX, margin.top);
@@ -213,6 +240,15 @@ function drawPlot() {
 
   const drawCurve = (points, color, width, alpha = 1) => {
     const visiblePoints = points.filter(point => point.rank >= 0 && point.rank < candidateCount);
+    if (visiblePoints.length === 1) {
+      context.beginPath();
+      context.arc(x(visiblePoints[0].rank), y(visiblePoints[0].value), 2.5, 0, Math.PI * 2);
+      context.fillStyle = color;
+      context.globalAlpha = alpha;
+      context.fill();
+      context.globalAlpha = 1;
+      return;
+    }
     if (visiblePoints.length < 2) return;
     context.strokeStyle = color;
     context.globalAlpha = alpha;
@@ -235,7 +271,7 @@ function drawPlot() {
   context.textBaseline = "alphabetic";
   axisRanks.forEach((rank, index) => {
     context.textAlign = index === 0 ? "left" : index === axisRanks.length - 1 ? "right" : "center";
-    const label = index === 0 ? "Top 1" : index === axisRanks.length - 1 ? `Pool ${candidateCount}` : `Top ${rank + 1}`;
+    const label = index === 0 ? "Top 1" : index === axisRanks.length - 1 ? `Cap ${rankDomainCount}` : `Top ${rank + 1}`;
     context.fillText(label, x(rank), h - 7);
   });
   context.textAlign = "left";
@@ -245,11 +281,12 @@ function drawPlot() {
   if (!stableView.current && view) {
     elements.scopeCaption.textContent = `Updating preview · ${diversityStatus} · showing previous curve`;
   } else if (view?.preview) {
-    elements.scopeCaption.textContent = `Illustrative preview · ${diversityStatus} · log-rank axis`;
+    elements.scopeCaption.textContent =
+      `Illustrative preview · ${diversityStatus} · ${candidateCount} retained · fitted probability range`;
   } else if (view) {
     const tokenStatus = view.representativeSampling ? "most uncertain token" : "selected token";
     elements.scopeCaption.textContent =
-      `Actual token probabilities · ${diversityStatus} · ${tokenStatus} ${JSON.stringify(view.selectedToken || "")}`;
+      `Actual token probabilities · ${diversityStatus} · ${candidateCount} retained · ${tokenStatus} ${JSON.stringify(view.selectedToken || "")}`;
   } else {
     elements.scopeCaption.textContent = `Preparing preview · ${diversityStatus}`;
   }
@@ -335,7 +372,8 @@ async function sendMessage() {
 
 for (const element of [elements.profile, elements.seed, elements.protectControlTokens]) element.addEventListener("change", queueSettings);
 elements.diversity.addEventListener("input", queueSettings);
-elements.candidateCount.addEventListener("change", queueSettings);
+elements.candidateCap.addEventListener("change", queueSettings);
+elements.minimumRelativeProbability.addEventListener("change", queueSettings);
 
 elements.send.addEventListener("click", sendMessage);
 elements.stop.addEventListener("click", () => request("/api/stop", { method: "POST", body: "{}" }).catch(error => elements.error.textContent = error.message));

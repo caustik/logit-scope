@@ -42,6 +42,18 @@ void append_sampling_data(json& result, const SamplingSnapshot& snapshot)
     }
 }
 
+json settings_to_json(const ShapeSettings& settings)
+{
+    return {
+        {"profile", rank_profile_name(settings.profile)},
+        {"diversity", settings.diversity},
+        {"candidateCap", settings.candidate_cap},
+        {"minimumRelativeProbability", settings.minimum_relative_probability},
+        {"seed", settings.seed},
+        {"protectControlTokens", settings.protect_control_tokens},
+    };
+}
+
 json snapshot_to_json(const SamplingSnapshot& snapshot, const SamplingSnapshot& preview, const ShapeSettings& settings)
 {
     json result = {
@@ -52,14 +64,8 @@ json snapshot_to_json(const SamplingSnapshot& snapshot, const SamplingSnapshot& 
         {"selectedToken", snapshot.selected_token},
         {"samplingStep", snapshot.sampling_step},
         {"representativeSampling", snapshot.representative_sampling},
-        {"settings",
-         {
-             {"profile", rank_profile_name(settings.profile)},
-             {"diversity", settings.diversity},
-             {"candidateCount", settings.candidate_count},
-             {"seed", settings.seed},
-             {"protectControlTokens", settings.protect_control_tokens},
-         }},
+        {"settings", settings_to_json(settings)},
+        {"samplingSettings", settings_to_json(snapshot.sampling_settings)},
     };
     append_sampling_data(result, snapshot);
     result["preview"] = json::object();
@@ -140,7 +146,9 @@ class Server::Impl
                                  settings.profile = profile;
                              }
                              if (input.contains("diversity")) settings.diversity = input.at("diversity").get<float>();
-                             if (input.contains("candidateCount")) settings.candidate_count = input.at("candidateCount").get<std::size_t>();
+                             if (input.contains("candidateCap")) settings.candidate_cap = input.at("candidateCap").get<std::size_t>();
+                             if (input.contains("minimumRelativeProbability"))
+                                 settings.minimum_relative_probability = input.at("minimumRelativeProbability").get<float>();
                              if (input.contains("seed")) settings.seed = input.at("seed").get<std::uint32_t>();
                              if (input.contains("protectControlTokens"))
                                  settings.protect_control_tokens = input.at("protectControlTokens").get<bool>();

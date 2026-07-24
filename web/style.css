@@ -60,7 +60,7 @@ h2 { font-size: 15px; font-weight: 650; }
 
 .controls {
   display: grid;
-  grid-template-columns: 150px minmax(260px, 1fr) 90px 130px auto;
+  grid-template-columns: 142px minmax(240px, 1fr) 105px 130px 115px auto;
   gap: 14px;
   align-items: end;
   padding: 13px 15px;
@@ -90,6 +90,12 @@ select:focus, input:focus, textarea:focus { border-color: var(--accent); box-sha
 input[type="range"] { width: 100%; accent-color: var(--accent); }
 .check-control { display: flex; align-items: center; gap: 7px; height: 34px; white-space: nowrap; }
 .check-control input { accent-color: var(--accent); }
+.control-note {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
 
 .scope { padding: 14px 15px 12px; margin-bottom: 12px; }
 .scope-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; }

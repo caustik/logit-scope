@@ -2,10 +2,10 @@
 
 #include "logit_scope/rank_profile.h"
 
-#include <array>
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <array>
 
 namespace logit_scope
 {
@@ -30,6 +30,7 @@ struct SamplingSnapshot
     std::string selected_token;
     int sampling_step = 0;
     bool representative_sampling = false;
+    ShapeSettings sampling_settings;
     std::size_t candidate_count = 0;
     std::size_t probability_count = 0;
     std::array<std::size_t, display_rank_count> probability_ranks{};
