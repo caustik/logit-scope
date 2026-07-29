@@ -1,18 +1,23 @@
 #include "logit_scope/engine.h"
+#include "logit_scope/distribution_metrics.h"
 
 #include <llama.h>
 
 #include <condition_variable>
+#include <unordered_set>
 #include <string_view>
 #include <filesystem>
 #include <functional>
 #include <algorithm>
+#include <stdexcept>
 #include <iostream>
 #include <cstdint>
+#include <numeric>
 #include <utility>
 #include <atomic>
 #include <cctype>
 #include <limits>
+#include <random>
 #include <thread>
 #include <vector>
 #include <cmath>
@@ -136,8 +141,9 @@ class Engine::Impl
         if (message.empty()) return false;
 
         {
+            const std::lock_guard offline_job_lock(offline_job_mutex_);
             const std::lock_guard snapshot_lock(snapshot_mutex_);
-            if (!snapshot_.model_loaded || snapshot_.generating) return false;
+            if (offline_job_type_ != OfflineJobType::none || !snapshot_.model_loaded || snapshot_.generating) return false;
             snapshot_.generating = true;
             snapshot_.status = "Queued...";
         }
@@ -157,23 +163,19 @@ class Engine::Impl
         while (!prompt.empty() && std::isspace(static_cast<unsigned char>(prompt.back()))) prompt.pop_back();
         if (prompt.empty()) return 0;
 
-        {
-            const std::lock_guard evaluation_lock(evaluation_mutex_);
-            if (evaluation_in_progress_) return 0;
-            evaluation_in_progress_ = true;
-        }
-
         EvaluationRequest request;
         request.id = next_evaluation_id_.fetch_add(1);
         request.prompt = std::move(prompt);
         request.settings = settings;
         request.restoration_settings = shape_settings();
         {
+            const std::lock_guard offline_job_lock(offline_job_mutex_);
+            if (offline_job_type_ != OfflineJobType::none) return 0;
+            offline_job_type_ = OfflineJobType::blind_evaluation;
             const std::lock_guard snapshot_lock(snapshot_mutex_);
             if (!snapshot_.model_loaded || snapshot_.generating)
             {
-                const std::lock_guard evaluation_lock(evaluation_mutex_);
-                evaluation_in_progress_ = false;
+                offline_job_type_ = OfflineJobType::none;
                 return 0;
             }
             request.restoration_snapshot = snapshot_;
@@ -191,6 +193,45 @@ class Engine::Impl
         {
             const std::lock_guard queue_lock(queue_mutex_);
             pending_evaluations_.push_back(std::move(request));
+        }
+        cancel_requested_.store(false);
+        queue_condition_.notify_one();
+        return id;
+    }
+
+    std::uint64_t submit_distribution(DistributionProbeRequest request)
+    {
+        validate_distribution_request(request);
+
+        PendingDistributionProbe pending;
+        pending.id = next_distribution_id_.fetch_add(1);
+        pending.request = std::move(request);
+        {
+            const std::lock_guard offline_job_lock(offline_job_mutex_);
+            if (offline_job_type_ != OfflineJobType::none) return 0;
+            offline_job_type_ = OfflineJobType::distribution_probe;
+            const std::lock_guard snapshot_lock(snapshot_mutex_);
+            if (!snapshot_.model_loaded || snapshot_.generating)
+            {
+                offline_job_type_ = OfflineJobType::none;
+                return 0;
+            }
+            pending.restoration_snapshot = snapshot_;
+            snapshot_.generating = true;
+            snapshot_.status = "Running Distribution Lab probe...";
+        }
+        {
+            const std::lock_guard distribution_lock(distribution_mutex_);
+            distribution_result_ = {};
+            distribution_result_.id = pending.id;
+            distribution_result_.generating = true;
+            distribution_result_.status = "Preparing distribution probe...";
+            distribution_result_.mapping_id = pending.request.mapping_id;
+        }
+        const auto id = pending.id;
+        {
+            const std::lock_guard queue_lock(queue_mutex_);
+            pending_distributions_.push_back(std::move(pending));
         }
         cancel_requested_.store(false);
         queue_condition_.notify_one();
@@ -292,7 +333,20 @@ class Engine::Impl
         return evaluation_result_;
     }
 
+    DistributionProbeResult distribution_result() const
+    {
+        const std::lock_guard lock(distribution_mutex_);
+        return distribution_result_;
+    }
+
   private:
+    enum class OfflineJobType
+    {
+        none,
+        blind_evaluation,
+        distribution_probe,
+    };
+
     struct SamplerContext
     {
         Impl* engine = nullptr;
@@ -325,6 +379,26 @@ class Engine::Impl
         SamplingSnapshot restoration_snapshot;
     };
 
+    struct PendingDistributionProbe
+    {
+        std::uint64_t id = 0;
+        DistributionProbeRequest request;
+        SamplingSnapshot restoration_snapshot;
+    };
+
+    struct CandidateTransformDiagnostics
+    {
+        std::vector<int> retained_token_ids;
+        std::vector<double> retained_raw_probabilities;
+        std::vector<double> shaped_probabilities;
+        std::vector<int> retained_ranks;
+        double retained_probability_mass = 0.0;
+        ProbabilityMetrics raw_metrics;
+        ProbabilityMetrics target_metrics;
+        ProbabilityMetrics shaped_metrics;
+        bool target_saturated = false;
+    };
+
     void run()
     {
         if (!initialize_model()) return;
@@ -333,13 +407,14 @@ class Engine::Impl
         {
             std::string message;
             EvaluationRequest evaluation;
+            PendingDistributionProbe distribution;
             {
                 std::unique_lock lock(queue_mutex_);
                 queue_condition_.wait(lock,
                                       [this]
                                       {
                                           return stop_requested_.load() || reset_requested_.load() || !pending_messages_.empty() ||
-                                                 !pending_evaluations_.empty();
+                                                 !pending_evaluations_.empty() || !pending_distributions_.empty();
                                       });
                 if (stop_requested_.load()) break;
 
@@ -347,10 +422,18 @@ class Engine::Impl
                 {
                     pending_messages_.clear();
                     pending_evaluations_.clear();
+                    pending_distributions_.clear();
                     {
                         const std::lock_guard evaluation_lock(evaluation_mutex_);
                         evaluation_result_ = {};
-                        evaluation_in_progress_ = false;
+                    }
+                    {
+                        const std::lock_guard distribution_lock(distribution_mutex_);
+                        distribution_result_ = {};
+                    }
+                    {
+                        const std::lock_guard offline_job_lock(offline_job_mutex_);
+                        offline_job_type_ = OfflineJobType::none;
                     }
                     pending_sampling_ = {};
                     representative_sampling_ = {};
@@ -379,12 +462,19 @@ class Engine::Impl
                     evaluation = std::move(pending_evaluations_.front());
                     pending_evaluations_.pop_front();
                 }
+                else if (!pending_distributions_.empty())
+                {
+                    distribution = std::move(pending_distributions_.front());
+                    pending_distributions_.pop_front();
+                }
             }
 
             if (!message.empty())
                 process_message(message);
             else if (evaluation.id != 0)
                 process_evaluation(std::move(evaluation));
+            else if (distribution.id != 0)
+                process_distribution_probe(std::move(distribution));
         }
 
         release_model();
@@ -429,7 +519,477 @@ class Engine::Impl
         {
             const std::lock_guard evaluation_lock(evaluation_mutex_);
             evaluation_result_ = std::move(result);
-            evaluation_in_progress_ = false;
+        }
+        {
+            const std::lock_guard offline_job_lock(offline_job_mutex_);
+            offline_job_type_ = OfflineJobType::none;
+        }
+    }
+
+    static void validate_distribution_request(const DistributionProbeRequest& request)
+    {
+        const auto has_non_whitespace = [](const std::string& text)
+        { return std::any_of(text.begin(), text.end(), [](unsigned char value) { return !std::isspace(value); }); };
+        if (!has_non_whitespace(request.prompt)) throw std::invalid_argument("Distribution prompt is empty");
+        if (request.assistant_prefix.empty() || request.assistant_prefix.size() > 128)
+            throw std::invalid_argument("Assistant prefix must contain 1 through 128 bytes");
+        if (request.mapping_id.empty()) throw std::invalid_argument("Mapping ID is empty");
+        if (request.outcomes.size() < 2 || request.outcomes.size() > 26)
+            throw std::invalid_argument("Distribution probes require 2 through 26 outcomes");
+        if (request.configurations.empty() || request.configurations.size() > 4)
+            throw std::invalid_argument("Distribution probes require 1 through 4 configurations");
+        if (request.sample_count > 1000000) throw std::invalid_argument("Projected sample count exceeds 1,000,000");
+
+        std::unordered_set<std::string> outcome_ids;
+        std::unordered_set<std::string> labels;
+        double target_total = 0.0;
+        for (const auto& outcome : request.outcomes)
+        {
+            if (outcome.id.empty() || outcome.label.empty()) throw std::invalid_argument("Outcome IDs and labels must not be empty");
+            if (!outcome_ids.insert(outcome.id).second) throw std::invalid_argument("Outcome IDs must be unique");
+            if (!labels.insert(outcome.label).second) throw std::invalid_argument("Outcome labels must be unique");
+            if (!std::isfinite(outcome.target_probability) || outcome.target_probability < 0.0 || outcome.target_probability > 1.0)
+                throw std::invalid_argument("Target probabilities must be finite values from 0 through 1");
+            target_total += outcome.target_probability;
+        }
+        if (std::abs(target_total - 1.0) > 1.0e-6) throw std::invalid_argument("Target probabilities must sum to 1");
+
+        std::unordered_set<std::string> configuration_ids;
+        for (const auto& configuration : request.configurations)
+        {
+            if (configuration.id.empty() || configuration.name.empty())
+                throw std::invalid_argument("Configuration IDs and names must not be empty");
+            if (!configuration_ids.insert(configuration.id).second) throw std::invalid_argument("Configuration IDs must be unique");
+            const auto& settings = configuration.settings;
+            if (!std::isfinite(settings.diversity) || settings.diversity < 0.0f || settings.diversity > maximum_diversity)
+                throw std::invalid_argument("Configuration diversity is outside the supported range");
+            if (settings.candidate_cap < 2 || settings.candidate_cap > maximum_candidate_cap)
+                throw std::invalid_argument("Configuration candidate cap is outside the supported range");
+            if (!std::isfinite(settings.minimum_relative_probability) || settings.minimum_relative_probability < 0.0f ||
+                settings.minimum_relative_probability > 1.0f)
+                throw std::invalid_argument("Configuration Min-P floor is outside the supported range");
+        }
+    }
+
+    static void copy_metric_result(const DistributionMetricResult& source, DistributionDistanceMetrics& destination)
+    {
+        destination.total_variation = source.total_variation;
+        destination.js_divergence_nats = source.js_divergence_nats;
+        destination.js_distance_normalized = source.js_distance_normalized;
+        destination.conditional_entropy = source.entropy;
+        destination.conditional_entropy_error = source.entropy_error;
+        destination.pairwise_order_accuracy = source.pairwise_order_accuracy;
+        destination.missing_target_mass = source.missing_target_mass;
+    }
+
+    static void calculate_stage_metrics(DistributionStageResult& stage, double target_entropy)
+    {
+        std::vector<double> predicted;
+        std::vector<double> target;
+        std::vector<bool> retained;
+        predicted.reserve(stage.outcomes.size());
+        target.reserve(stage.outcomes.size());
+        retained.reserve(stage.outcomes.size());
+        for (const auto& outcome : stage.outcomes)
+        {
+            predicted.push_back(outcome.probability);
+            target.push_back(outcome.target_probability);
+            retained.push_back(outcome.retained);
+        }
+
+        const auto valid_mass = std::accumulate(predicted.begin(), predicted.end(), 0.0);
+        const auto invalid_mass = std::max(0.0, 1.0 - valid_mass);
+        auto predicted_open = predicted;
+        auto target_open = target;
+        auto retained_open = retained;
+        predicted_open.push_back(invalid_mass);
+        target_open.push_back(0.0);
+        retained_open.push_back(true);
+        copy_metric_result(DistributionMetrics::calculate(predicted_open, target_open, retained_open, target_entropy), stage.open_metrics);
+        stage.open_metrics.valid_mass = valid_mass;
+        stage.open_metrics.invalid_mass = invalid_mass;
+
+        if (valid_mass <= std::numeric_limits<double>::min())
+        {
+            stage.conditional_metrics.valid = false;
+            stage.conditional_metrics.valid_mass = 0.0;
+            stage.conditional_metrics.invalid_mass = 1.0;
+            stage.conditional_metrics.missing_target_mass = stage.open_metrics.missing_target_mass;
+            stage.open_metrics.conditional_entropy = 0.0;
+            stage.open_metrics.conditional_entropy_error = -target_entropy;
+            stage.open_metrics.pairwise_order_accuracy = 0.0;
+            return;
+        }
+
+        const auto conditional = DistributionMetrics::conditional_distribution(predicted);
+        copy_metric_result(DistributionMetrics::calculate(conditional, target, retained, target_entropy), stage.conditional_metrics);
+        stage.conditional_metrics.valid_mass = 1.0;
+        stage.conditional_metrics.invalid_mass = 0.0;
+        stage.open_metrics.conditional_entropy = stage.conditional_metrics.conditional_entropy;
+        stage.open_metrics.conditional_entropy_error = stage.conditional_metrics.conditional_entropy_error;
+        stage.open_metrics.pairwise_order_accuracy = stage.conditional_metrics.pairwise_order_accuracy;
+    }
+
+    std::string token_display_text(int token_id) const
+    {
+        auto text = sanitize_utf8(token_to_piece(vocab_, token_id));
+        std::string display;
+        display.reserve(text.size());
+        for (const auto character : text)
+        {
+            switch (character)
+            {
+            case '\n':
+                display += "\\n";
+                break;
+            case '\r':
+                display += "\\r";
+                break;
+            case '\t':
+                display += "\\t";
+                break;
+            default:
+                display.push_back(character);
+                break;
+            }
+        }
+        return display.empty() ? "<empty>" : display;
+    }
+
+    DistributionStageResult create_distribution_stage(const DistributionProbeRequest& request, const std::vector<int>& label_token_ids,
+                                                      const std::vector<int>& token_ids, const std::vector<double>& probabilities,
+                                                      const std::vector<int>& ranks) const
+    {
+        DistributionStageResult stage;
+        stage.outcomes.reserve(request.outcomes.size());
+        for (std::size_t outcome_index = 0; outcome_index < request.outcomes.size(); ++outcome_index)
+        {
+            const auto& requested = request.outcomes[outcome_index];
+            DistributionOutcomeResult outcome;
+            outcome.id = requested.id;
+            outcome.text = requested.text;
+            outcome.label = requested.label;
+            outcome.token_id = label_token_ids[outcome_index];
+            outcome.target_probability = requested.target_probability;
+            const auto found = std::find(token_ids.begin(), token_ids.end(), outcome.token_id);
+            if (found != token_ids.end())
+            {
+                const auto index = static_cast<std::size_t>(std::distance(token_ids.begin(), found));
+                outcome.probability = probabilities[index];
+                outcome.retained = true;
+                outcome.rank = ranks[index];
+            }
+            stage.outcomes.push_back(std::move(outcome));
+        }
+
+        const std::unordered_set<int> valid_tokens(label_token_ids.begin(), label_token_ids.end());
+        for (std::size_t index = 0; index < token_ids.size() && stage.top_invalid_tokens.size() < 10; ++index)
+        {
+            if (valid_tokens.find(token_ids[index]) != valid_tokens.end()) continue;
+            stage.top_invalid_tokens.push_back(
+                {token_ids[index], token_display_text(token_ids[index]), probabilities[index], ranks[index]});
+        }
+        calculate_stage_metrics(stage, DistributionMetrics::entropy(
+                                           [&request]
+                                           {
+                                               std::vector<double> target;
+                                               target.reserve(request.outcomes.size());
+                                               for (const auto& outcome : request.outcomes) target.push_back(outcome.target_probability);
+                                               return target;
+                                           }()));
+        return stage;
+    }
+
+    static std::uint64_t projected_seed(std::uint32_t seed, const std::string& mapping_id, const std::string& configuration_id)
+    {
+        auto hash = std::uint64_t{14695981039346656037ull};
+        const auto append = [&hash](const std::string& text)
+        {
+            for (const auto character : text)
+            {
+                hash ^= static_cast<unsigned char>(character);
+                hash *= 1099511628211ull;
+            }
+            hash ^= 0xffu;
+            hash *= 1099511628211ull;
+        };
+        append(mapping_id);
+        append(configuration_id);
+        return hash ^ static_cast<std::uint64_t>(seed);
+    }
+
+    static double next_unit_interval(std::mt19937_64& random) { return static_cast<double>(random() >> 11) * 0x1.0p-53; }
+
+    static void create_projected_counts(DistributionStageResult& stage, std::size_t sample_count, std::uint64_t seed)
+    {
+        std::vector<double> cumulative;
+        cumulative.reserve(stage.outcomes.size() + 1);
+        double total = 0.0;
+        for (const auto& outcome : stage.outcomes)
+        {
+            total += outcome.probability;
+            cumulative.push_back(total);
+        }
+        total += std::max(0.0, 1.0 - total);
+        cumulative.push_back(total);
+        if (total <= std::numeric_limits<double>::min()) return;
+        for (auto& value : cumulative) value /= total;
+        cumulative.back() = 1.0;
+
+        std::mt19937_64 random(seed);
+        for (std::size_t sample = 0; sample < sample_count; ++sample)
+        {
+            const auto selected = std::upper_bound(cumulative.begin(), cumulative.end(), next_unit_interval(random));
+            const auto index = static_cast<std::size_t>(std::distance(cumulative.begin(), selected));
+            if (index < stage.outcomes.size())
+                ++stage.outcomes[index].projected_count;
+            else
+                ++stage.projected_invalid_count;
+        }
+    }
+
+    struct DistributionBoundaryCandidate
+    {
+        std::string assistant_prefix;
+        std::string label_token_prefix;
+    };
+
+    static std::vector<DistributionBoundaryCandidate> distribution_boundary_candidates(const DistributionProbeRequest& request)
+    {
+        std::vector<DistributionBoundaryCandidate> candidates;
+        const auto append_candidate = [&candidates](std::string assistant_prefix, std::string label_token_prefix = {})
+        {
+            if (assistant_prefix.empty() || assistant_prefix.size() > 128 ||
+                std::find_if(
+                    candidates.begin(), candidates.end(), [&assistant_prefix, &label_token_prefix](const auto& candidate)
+                    { return candidate.assistant_prefix == assistant_prefix && candidate.label_token_prefix == label_token_prefix; }) !=
+                    candidates.end())
+                return;
+            candidates.push_back({std::move(assistant_prefix), std::move(label_token_prefix)});
+        };
+        append_candidate(request.assistant_prefix);
+        if (!request.auto_select_assistant_prefix) return candidates;
+
+        auto base = request.assistant_prefix;
+        while (!base.empty() && std::isspace(static_cast<unsigned char>(base.back()))) base.pop_back();
+        if (base.size() != request.assistant_prefix.size()) append_candidate(base, request.assistant_prefix.substr(base.size()));
+        constexpr auto arrow = "\xe2\x86\x92";
+        append_candidate(base + arrow);
+        append_candidate(base + "\n");
+        append_candidate(base + "[");
+        append_candidate(base + "|");
+        append_candidate(base + "_");
+        append_candidate(std::string{"Answer:"} + arrow);
+        append_candidate("Answer:\n");
+        append_candidate(arrow);
+        append_candidate("\n");
+        append_candidate("[");
+        return candidates;
+    }
+
+    bool resolve_distribution_prefix(const DistributionProbeRequest& request, const std::string& formatted_chat,
+                                     std::string& formatted_prompt, std::string& assistant_prefix, std::string& label_token_prefix,
+                                     std::vector<llama_token>& prompt_tokens, std::vector<int>& label_token_ids) const
+    {
+        for (const auto& candidate : distribution_boundary_candidates(request))
+        {
+            auto candidate_prompt = formatted_chat + candidate.assistant_prefix;
+            std::vector<llama_token> candidate_prompt_tokens;
+            if (!tokenize(candidate_prompt, true, candidate_prompt_tokens) || candidate_prompt_tokens.empty()) continue;
+
+            std::vector<int> candidate_label_token_ids;
+            candidate_label_token_ids.reserve(request.outcomes.size());
+            auto valid = true;
+            for (const auto& outcome : request.outcomes)
+            {
+                std::vector<llama_token> extended_tokens;
+                if (!tokenize(candidate_prompt + candidate.label_token_prefix + outcome.label, true, extended_tokens) ||
+                    extended_tokens.size() != candidate_prompt_tokens.size() + 1 ||
+                    !std::equal(candidate_prompt_tokens.begin(), candidate_prompt_tokens.end(), extended_tokens.begin()))
+                {
+                    valid = false;
+                    break;
+                }
+                const auto token_id = extended_tokens.back();
+                if (std::find(candidate_label_token_ids.begin(), candidate_label_token_ids.end(), token_id) !=
+                    candidate_label_token_ids.end())
+                {
+                    valid = false;
+                    break;
+                }
+                candidate_label_token_ids.push_back(token_id);
+            }
+            if (!valid) continue;
+
+            formatted_prompt = std::move(candidate_prompt);
+            assistant_prefix = candidate.assistant_prefix;
+            label_token_prefix = candidate.label_token_prefix;
+            prompt_tokens = std::move(candidate_prompt_tokens);
+            label_token_ids = std::move(candidate_label_token_ids);
+            return true;
+        }
+        return false;
+    }
+
+    void process_distribution_probe(PendingDistributionProbe pending)
+    {
+        auto saved_messages = std::move(messages_);
+        auto saved_response = std::move(current_response_);
+        const auto saved_pending_sampling = pending_sampling_;
+        const auto saved_representative_sampling = representative_sampling_;
+
+        messages_.clear();
+        current_response_.clear();
+        pending_sampling_ = {};
+        representative_sampling_ = {};
+        previous_formatted_length_ = 0;
+        if (context_ != nullptr) llama_memory_clear(llama_get_memory(context_), true);
+
+        DistributionProbeResult result;
+        result.id = pending.id;
+        result.prompt = pending.request.prompt;
+        result.requested_assistant_prefix = pending.request.assistant_prefix;
+        result.mapping_id = pending.request.mapping_id;
+        result.model_path = config_.model_path;
+        result.sample_count = pending.request.sample_count;
+        result.seed = pending.request.seed;
+        std::vector<double> target;
+        target.reserve(pending.request.outcomes.size());
+        for (const auto& outcome : pending.request.outcomes) target.push_back(outcome.target_probability);
+        result.task_target_entropy = DistributionMetrics::entropy(target);
+
+        try
+        {
+            messages_.push_back({"user", pending.request.prompt});
+            std::string formatted_chat;
+            if (!format_messages(true, formatted_chat)) throw std::runtime_error("Unable to apply the model chat template");
+            std::vector<llama_token> prompt_tokens;
+            std::vector<int> label_token_ids;
+            if (!resolve_distribution_prefix(pending.request, formatted_chat, result.formatted_prompt, result.assistant_prefix,
+                                             result.label_token_prefix, prompt_tokens, label_token_ids))
+                throw std::runtime_error(pending.request.auto_select_assistant_prefix
+                                             ? "Unable to find a compatible one-token label boundary for this tokenizer"
+                                             : "Assistant prefix \"" + pending.request.assistant_prefix +
+                                                   "\" does not keep every label as one distinct token for this tokenizer");
+            result.assistant_prefix_auto_selected =
+                result.assistant_prefix != result.requested_assistant_prefix || !result.label_token_prefix.empty();
+            result.prompt_token_count = static_cast<int>(prompt_tokens.size());
+
+            if (prompt_tokens.size() > static_cast<std::size_t>(llama_n_ctx(context_)))
+                throw std::runtime_error("Distribution prompt exceeds the model context");
+            const auto batch_capacity = std::max<std::size_t>(1, static_cast<std::size_t>(llama_n_batch(context_)));
+            for (std::size_t offset = 0; offset < prompt_tokens.size(); offset += batch_capacity)
+            {
+                if (stop_requested_.load() || reset_requested_.load() || cancel_requested_.load())
+                    throw std::runtime_error("Distribution probe cancelled");
+                const auto count = std::min(batch_capacity, prompt_tokens.size() - offset);
+                auto batch = llama_batch_get_one(prompt_tokens.data() + offset, static_cast<int32_t>(count));
+                if (llama_decode(context_, batch) != 0) throw std::runtime_error("llama_decode failed for the distribution prompt");
+            }
+
+            const auto vocabulary_size = llama_vocab_n_tokens(vocab_);
+            const auto* logits = llama_get_logits_ith(context_, -1);
+            if (vocabulary_size <= 0 || logits == nullptr) throw std::runtime_error("The model did not provide next-token logits");
+            std::vector<llama_token_data> raw_candidates;
+            raw_candidates.reserve(static_cast<std::size_t>(vocabulary_size));
+            for (int token_id = 0; token_id < vocabulary_size; ++token_id) raw_candidates.push_back({token_id, logits[token_id], 0.0f});
+
+            std::vector<std::size_t> raw_order;
+            raw_order.reserve(raw_candidates.size());
+            auto maximum_logit = -std::numeric_limits<double>::infinity();
+            for (std::size_t index = 0; index < raw_candidates.size(); ++index)
+            {
+                if (!std::isfinite(raw_candidates[index].logit)) continue;
+                raw_order.push_back(index);
+                maximum_logit = std::max(maximum_logit, static_cast<double>(raw_candidates[index].logit));
+            }
+            if (raw_order.empty() || !std::isfinite(maximum_logit)) throw std::runtime_error("The model returned no finite logits");
+            std::sort(raw_order.begin(), raw_order.end(),
+                      [&raw_candidates](std::size_t left, std::size_t right)
+                      {
+                          const auto left_logit = raw_candidates[left].logit;
+                          const auto right_logit = raw_candidates[right].logit;
+                          return left_logit == right_logit ? left < right : left_logit > right_logit;
+                      });
+            double total_weight = 0.0;
+            for (const auto index : raw_order) total_weight += std::exp(static_cast<double>(raw_candidates[index].logit) - maximum_logit);
+            if (!(total_weight > 0.0) || !std::isfinite(total_weight)) throw std::runtime_error("The full raw softmax is invalid");
+
+            std::vector<int> full_token_ids;
+            std::vector<double> full_probabilities;
+            std::vector<int> full_ranks;
+            full_token_ids.reserve(raw_order.size());
+            full_probabilities.reserve(raw_order.size());
+            full_ranks.reserve(raw_order.size());
+            for (std::size_t rank = 0; rank < raw_order.size(); ++rank)
+            {
+                const auto index = raw_order[rank];
+                full_token_ids.push_back(raw_candidates[index].id);
+                full_probabilities.push_back(std::exp(static_cast<double>(raw_candidates[index].logit) - maximum_logit) / total_weight);
+                full_ranks.push_back(static_cast<int>(rank));
+            }
+            result.full_raw = create_distribution_stage(pending.request, label_token_ids, full_token_ids, full_probabilities, full_ranks);
+
+            for (const auto& requested_configuration : pending.request.configurations)
+            {
+                if (stop_requested_.load() || reset_requested_.load() || cancel_requested_.load())
+                    throw std::runtime_error("Distribution probe cancelled");
+                auto candidates = raw_candidates;
+                llama_token_data_array candidate_array{candidates.data(), candidates.size(), -1, false};
+                CandidateTransformDiagnostics diagnostics;
+                transform_candidates(&candidate_array, requested_configuration.settings, &diagnostics);
+                if (diagnostics.retained_token_ids.empty()) throw std::runtime_error("A sampler configuration retained no candidates");
+
+                DistributionConfigurationResult configuration;
+                configuration.id = requested_configuration.id;
+                configuration.name = requested_configuration.name;
+                configuration.settings = requested_configuration.settings;
+                configuration.retained_raw = create_distribution_stage(pending.request, label_token_ids, diagnostics.retained_token_ids,
+                                                                       diagnostics.retained_raw_probabilities, diagnostics.retained_ranks);
+                configuration.shaped = create_distribution_stage(pending.request, label_token_ids, diagnostics.retained_token_ids,
+                                                                 diagnostics.shaped_probabilities, diagnostics.retained_ranks);
+                create_projected_counts(configuration.shaped, pending.request.sample_count,
+                                        projected_seed(pending.request.seed, pending.request.mapping_id, requested_configuration.id));
+                configuration.diagnostics.support_size = static_cast<int>(diagnostics.retained_token_ids.size());
+                configuration.diagnostics.retained_probability_mass = diagnostics.retained_probability_mass;
+                configuration.diagnostics.sampler_raw_entropy = diagnostics.raw_metrics.entropy;
+                configuration.diagnostics.sampler_target_entropy = diagnostics.target_metrics.entropy;
+                configuration.diagnostics.sampler_shaped_entropy = diagnostics.shaped_metrics.entropy;
+                configuration.diagnostics.sampler_entropy_error = diagnostics.shaped_metrics.entropy - diagnostics.target_metrics.entropy;
+                configuration.diagnostics.raw_effective_choices = std::exp(diagnostics.raw_metrics.entropy);
+                configuration.diagnostics.target_effective_choices = std::exp(diagnostics.target_metrics.entropy);
+                configuration.diagnostics.shaped_effective_choices = std::exp(diagnostics.shaped_metrics.entropy);
+                configuration.diagnostics.target_saturated = diagnostics.target_saturated;
+                result.configurations.push_back(std::move(configuration));
+            }
+
+            result.status = "Complete";
+        }
+        catch (const std::exception& error)
+        {
+            result.status = error.what();
+        }
+
+        result.ready = true;
+        result.generating = false;
+        messages_ = std::move(saved_messages);
+        current_response_ = std::move(saved_response);
+        pending_sampling_ = saved_pending_sampling;
+        representative_sampling_ = saved_representative_sampling;
+        previous_formatted_length_ = 0;
+        cancel_requested_.store(false);
+        if (context_ != nullptr) llama_memory_clear(llama_get_memory(context_), true);
+        {
+            const std::lock_guard snapshot_lock(snapshot_mutex_);
+            snapshot_ = std::move(pending.restoration_snapshot);
+        }
+        {
+            const std::lock_guard distribution_lock(distribution_mutex_);
+            distribution_result_ = std::move(result);
+        }
+        {
+            const std::lock_guard offline_job_lock(offline_job_mutex_);
+            offline_job_type_ = OfflineJobType::none;
         }
     }
 
@@ -748,11 +1308,10 @@ class Engine::Impl
         return std::max(minimum_rank, std::min(maximum_rank, logarithmic_rank));
     }
 
-    void apply_shaping(llama_token_data_array* candidates)
+    void transform_candidates(llama_token_data_array* candidates, const ShapeSettings& settings, CandidateTransformDiagnostics* diagnostics)
     {
         if (candidates == nullptr || candidates->data == nullptr || candidates->size == 0) return;
 
-        const auto settings = shape_settings();
         std::vector<std::size_t> ordered_indices;
         ordered_indices.reserve(candidates->size);
         float maximum_logit = -std::numeric_limits<float>::infinity();
@@ -778,10 +1337,12 @@ class Engine::Impl
 
         std::vector<float> raw_logits(candidate_cap);
         std::vector<llama_token_data> selected_candidates(candidate_cap);
+        std::vector<int> retained_ranks(candidate_cap);
         for (std::size_t rank = 0; rank < candidate_cap; ++rank)
         {
             raw_logits[rank] = candidates->data[ordered_indices[rank]].logit;
             selected_candidates[rank] = candidates->data[ordered_indices[rank]];
+            retained_ranks[rank] = static_cast<int>(rank);
         }
 
         if (settings.minimum_relative_probability > 0.0f)
@@ -797,12 +1358,15 @@ class Engine::Impl
                 if (raw_logits[rank] < minimum_logit && !protected_token) continue;
                 raw_logits[retained_count] = raw_logits[rank];
                 selected_candidates[retained_count] = selected_candidates[rank];
+                retained_ranks[retained_count] = retained_ranks[rank];
                 ++retained_count;
             }
             raw_logits.resize(retained_count);
             selected_candidates.resize(retained_count);
+            retained_ranks.resize(retained_count);
         }
         const auto shape_count = raw_logits.size();
+        if (shape_count == 0) return;
 
         auto shaped_logits = raw_logits;
         shape_ranked_logits(shaped_logits, settings);
@@ -839,6 +1403,18 @@ class Engine::Impl
         const auto raw_probabilities = probabilities_from_logits(raw_logits, &raw_metrics);
         const auto shaped_probabilities = probabilities_from_logits(shaped_logits, &shaped_metrics);
 
+        ProbabilityMetrics target_metrics = raw_metrics;
+        auto target_saturated = false;
+        if (settings.profile != RankProfile::none && settings.diversity != 1.0f)
+        {
+            const auto raw_effective_choices = std::exp(static_cast<double>(raw_metrics.entropy));
+            const auto requested_effective_choices =
+                1.0 + static_cast<double>(settings.diversity) * std::max(0.0, raw_effective_choices - 1.0);
+            const auto target_effective_choices = std::min(static_cast<double>(shape_count), requested_effective_choices);
+            target_metrics.entropy = static_cast<float>(std::log(target_effective_choices));
+            target_saturated = requested_effective_choices >= static_cast<double>(shape_count) - 1.0e-9;
+        }
+
         double total_weight = 0.0;
         for (std::size_t index = 0; index < candidates->size; ++index)
         {
@@ -848,31 +1424,65 @@ class Engine::Impl
         double selected_weight = 0.0;
         for (const auto logit : raw_logits) selected_weight += std::exp(static_cast<double>(logit - maximum_logit));
 
-        pending_sampling_ = {};
-        pending_sampling_.valid = true;
-        pending_sampling_.settings = settings;
-        pending_sampling_.candidate_count = shape_count;
-        pending_sampling_.probability_count = std::min(display_rank_count, shape_count);
-        auto previous_rank = std::size_t{};
-        for (std::size_t display_index = 0; display_index < pending_sampling_.probability_count; ++display_index)
+        if (diagnostics != nullptr)
         {
-            const auto rank = display_rank_at(display_index, pending_sampling_.probability_count, shape_count, previous_rank);
-            pending_sampling_.probability_ranks[display_index] = rank;
-            pending_sampling_.raw_probabilities[display_index] = raw_probabilities[rank];
-            pending_sampling_.shaped_probabilities[display_index] = shaped_probabilities[rank];
-            previous_rank = rank;
+            diagnostics->retained_token_ids.reserve(shape_count);
+            diagnostics->retained_raw_probabilities.reserve(shape_count);
+            diagnostics->shaped_probabilities.reserve(shape_count);
+            diagnostics->retained_ranks = retained_ranks;
+            for (std::size_t rank = 0; rank < shape_count; ++rank)
+            {
+                diagnostics->retained_token_ids.push_back(selected_candidates[rank].id);
+                diagnostics->retained_raw_probabilities.push_back(raw_probabilities[rank]);
+                diagnostics->shaped_probabilities.push_back(shaped_probabilities[rank]);
+            }
+            diagnostics->retained_probability_mass = total_weight > 0.0 ? selected_weight / total_weight : 0.0;
+            diagnostics->raw_metrics = raw_metrics;
+            diagnostics->target_metrics = target_metrics;
+            diagnostics->shaped_metrics = shaped_metrics;
+            diagnostics->target_saturated = target_saturated;
         }
-        pending_sampling_.raw_entropy = raw_metrics.entropy;
-        pending_sampling_.shaped_entropy = shaped_metrics.entropy;
-        pending_sampling_.raw_peak_probability = raw_metrics.peak_probability;
-        pending_sampling_.shaped_peak_probability = shaped_metrics.peak_probability;
-        pending_sampling_.pool_probability_mass = total_weight > 0.0 ? static_cast<float>(selected_weight / total_weight) : 0.0f;
-        pending_sampling_.jensen_shannon_divergence = jensen_shannon_divergence(raw_probabilities, shaped_probabilities);
 
         std::copy(selected_candidates.begin(), selected_candidates.end(), candidates->data);
         candidates->size = shape_count;
         candidates->selected = -1;
         candidates->sorted = true;
+    }
+
+    void apply_shaping(llama_token_data_array* candidates)
+    {
+        CandidateTransformDiagnostics diagnostics;
+        const auto settings = shape_settings();
+        transform_candidates(candidates, settings, &diagnostics);
+        if (diagnostics.retained_token_ids.empty()) return;
+
+        pending_sampling_ = {};
+        pending_sampling_.valid = true;
+        pending_sampling_.settings = settings;
+        pending_sampling_.candidate_count = diagnostics.retained_token_ids.size();
+        pending_sampling_.probability_count = std::min(display_rank_count, pending_sampling_.candidate_count);
+        auto previous_rank = std::size_t{};
+        for (std::size_t display_index = 0; display_index < pending_sampling_.probability_count; ++display_index)
+        {
+            const auto rank =
+                display_rank_at(display_index, pending_sampling_.probability_count, pending_sampling_.candidate_count, previous_rank);
+            pending_sampling_.probability_ranks[display_index] = rank;
+            pending_sampling_.raw_probabilities[display_index] = static_cast<float>(diagnostics.retained_raw_probabilities[rank]);
+            pending_sampling_.shaped_probabilities[display_index] = static_cast<float>(diagnostics.shaped_probabilities[rank]);
+            previous_rank = rank;
+        }
+        pending_sampling_.raw_entropy = diagnostics.raw_metrics.entropy;
+        pending_sampling_.shaped_entropy = diagnostics.shaped_metrics.entropy;
+        pending_sampling_.raw_peak_probability = diagnostics.raw_metrics.peak_probability;
+        pending_sampling_.shaped_peak_probability = diagnostics.shaped_metrics.peak_probability;
+        pending_sampling_.pool_probability_mass = static_cast<float>(diagnostics.retained_probability_mass);
+        std::vector<float> raw_probabilities;
+        std::vector<float> shaped_probabilities;
+        raw_probabilities.reserve(diagnostics.retained_raw_probabilities.size());
+        shaped_probabilities.reserve(diagnostics.shaped_probabilities.size());
+        for (const auto probability : diagnostics.retained_raw_probabilities) raw_probabilities.push_back(static_cast<float>(probability));
+        for (const auto probability : diagnostics.shaped_probabilities) shaped_probabilities.push_back(static_cast<float>(probability));
+        pending_sampling_.jensen_shannon_divergence = jensen_shannon_divergence(raw_probabilities, shaped_probabilities);
     }
 
     void commit_sampling_snapshot(llama_token selected_token)
@@ -1018,6 +1628,7 @@ class Engine::Impl
     std::condition_variable queue_condition_;
     std::deque<std::string> pending_messages_;
     std::deque<EvaluationRequest> pending_evaluations_;
+    std::deque<PendingDistributionProbe> pending_distributions_;
 
     mutable std::mutex snapshot_mutex_;
     SamplingSnapshot snapshot_;
@@ -1030,8 +1641,14 @@ class Engine::Impl
 
     mutable std::mutex evaluation_mutex_;
     EvaluationResult evaluation_result_;
-    bool evaluation_in_progress_ = false;
     std::atomic<std::uint64_t> next_evaluation_id_{1};
+
+    mutable std::mutex distribution_mutex_;
+    DistributionProbeResult distribution_result_;
+    std::atomic<std::uint64_t> next_distribution_id_{1};
+
+    mutable std::mutex offline_job_mutex_;
+    OfflineJobType offline_job_type_ = OfflineJobType::none;
 
     std::vector<ChatMessage> messages_;
     std::string current_response_;
@@ -1059,6 +1676,8 @@ std::uint64_t Engine::submit_evaluation(std::string prompt, const ShapeSettings&
     return impl_->submit_evaluation(std::move(prompt), settings);
 }
 
+std::uint64_t Engine::submit_distribution(DistributionProbeRequest request) { return impl_->submit_distribution(std::move(request)); }
+
 void Engine::cancel_generation() { impl_->cancel_generation(); }
 
 void Engine::clear_conversation() { impl_->clear_conversation(); }
@@ -1072,5 +1691,7 @@ SamplingSnapshot Engine::snapshot() const { return impl_->snapshot(); }
 SamplingSnapshot Engine::preview_snapshot(const ShapeSettings& settings) const { return impl_->preview_snapshot(settings); }
 
 EvaluationResult Engine::evaluation_result() const { return impl_->evaluation_result(); }
+
+DistributionProbeResult Engine::distribution_result() const { return impl_->distribution_result(); }
 
 } // namespace logit_scope

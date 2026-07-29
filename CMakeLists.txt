@@ -40,6 +40,7 @@ else()
 endif()
 
 add_library(logit_scope_core
+    src/distribution_metrics.cpp
     src/rank_profile.cpp
 )
 
@@ -100,6 +101,10 @@ if(LOGIT_SCOPE_BUILD_TESTS)
     add_executable(rank-profile-tests tests/rank_profile_tests.cpp)
     target_link_libraries(rank-profile-tests PRIVATE logit_scope_core)
     add_test(NAME rank-profile-tests COMMAND rank-profile-tests)
+
+    add_executable(distribution-metrics-tests tests/distribution_metrics_tests.cpp)
+    target_link_libraries(distribution-metrics-tests PRIVATE logit_scope_core)
+    add_test(NAME distribution-metrics-tests COMMAND distribution-metrics-tests)
 endif()
 
 install(TARGETS logit-scope RUNTIME DESTINATION bin)

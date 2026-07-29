@@ -37,6 +37,30 @@ Blind pairwise comparison reduces expectation and position effects; position bia
 
 The lab produces better evidence, not an automatic definition of quality. A single evaluator is still expressing preferences, a low repetition rate does not prove a good response, and a sign-test p-value measures consistency of the recorded choices rather than practical importance. Use varied prompts, inspect rubric dimensions rather than only overall wins, and collect at least 10 non-tied decisions before treating the result as more than exploratory. Experiments remain in browser-local storage until exported or deleted.
 
+## Distribution Lab
+
+The **Distribution Lab** measures whether sampler profiles allocate probability mass accurately on finite tasks with known answer distributions. Its default comparison holds candidate support fixed and evaluates entropy-matched **Temperature** and **Soliton** configurations from the same next-token logits.
+
+Built-in tasks cover the sum and maximum of two fair dice, the number of heads in four fair tosses, the first-head position in three tosses, and an explicit-probability pipeline control. A run works as follows:
+
+1. Choose a task, sampler settings, balanced-block count, preferred assistant prefix, projected-draw count, and seed. Distribution Lab defaults Min-P to off so valid answer labels are not removed before profile shaping.
+2. For each mapping, the interface assigns every semantic outcome an opaque uppercase label and rotates both label assignments and display positions. One balanced block gives every outcome every label and every position exactly once.
+3. The engine formats the prompt, validates every label as exactly one distinct token in that precise tokenizer context, and automatically selects a compatible boundary when the preferred assistant prefix would retokenize a label. This can move trailing whitespace from the decoded context into each label token, which lets tokenizers use their natural leading-space label tokens without changing the labels shown in the experiment. The resolved context prefix and label-token prefix are recorded with the result. The selected prompt is then decoded once to read the complete next-token logits.
+4. Every requested configuration transforms an independent copy of those same logits through the normal candidate cap, Min-P, rank-profile, and protocol-guard implementation.
+5. Results are converted from label space back to semantic outcomes and aggregated as both pooled scores and mean per-mapping scores. Mapping sensitivity shows when balanced averaging hides unstable individual prompts.
+
+The lab reports three probability stages:
+
+- **Full raw** is the model softmax over every finite vocabulary logit before filtering or shaping.
+- **Retained raw** is the normalized distribution after candidate-cap and Min-P support selection but before profile shaping.
+- **Shaped** is the final normalized distribution after the selected rank profile and protocol guard.
+
+Open-set metrics include probability assigned to every invalid token, while label-conditional metrics renormalize only the valid labels to isolate relative weighting from response-protocol failure. Total variation and normalized Jensen–Shannon distance are the primary distribution errors; valid/invalid mass, missing target mass, entropy error, pairwise order accuracy, top invalid tokens, and mapping sensitivity explain why a score changed.
+
+The **Projected draws** counts are deterministic categorical samples from the exact shaped probability vector. They make expected repeated behavior intuitive and verify the categorical sampler, but they are not repeated model decodes and are never the source of the score. Version 1 intentionally supports built-in finite tasks, one generated token, and context-validated one-token labels only. Automatic boundary selection tries the preferred prefix first and then a small set of explicit token boundaries; a tokenizer that cannot represent enough distinct labels in any supported context fails the probe clearly instead of producing misleading sequence probabilities. Automatic selection can be disabled in the advanced controls when an exact prompt protocol is required.
+
+Runs are saved separately from Blind Lab experiments in browser-local storage. A stopped or browser-interrupted run can resume from its next incomplete mapping. JSON export preserves every raw probe and its formatted prompt; long-form CSV repeats stage, mapping, semantic outcome, token, resolved boundary, exact probability, projected count, sampler diagnostics, and pooled metrics for analysis.
+
 ## Clone and build
 
 Prerequisites are Git, CMake 3.21 or newer, and a C++17 compiler. Ninja is used by the supplied macOS/Linux presets. On Windows, the preset uses Visual Studio 2022.
@@ -145,7 +169,7 @@ Before generation, the scope shows a clearly labeled illustrative rank curve and
 include/logit_scope/   Rank shaping and engine API
 src/                   llama.cpp sampler, chat engine, and local HTTP server
 web/                   Embedded HTML, CSS, and JavaScript UI
-tests/                 Dependency-free rank-profile tests
+tests/                 Dependency-free rank-profile and distribution-metric tests
 third_party/llama.cpp  Pinned llama.cpp Git submodule
 ```
 

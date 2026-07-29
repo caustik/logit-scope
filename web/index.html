@@ -103,6 +103,212 @@
       </div>
     </section>
 
+    <details class="evaluation distribution-lab panel">
+      <summary>
+        <span>
+          <strong>Distribution Lab</strong>
+          <small>Exact next-token calibration against known categorical distributions</small>
+        </span>
+        <span class="distribution-badge">Objective lab</span>
+      </summary>
+
+      <div class="distribution-body">
+        <div class="evaluation-intro">
+          <p>Each mapping asks for one draw from a process with a known answer distribution. Opaque labels and display positions rotate in balanced blocks so semantic outcomes are not tied to label or list-order priors.</p>
+          <p>Exact next-token probabilities are the score. Projected draws are a deterministic visualization of expected sampling behavior, not repeated model generations.</p>
+        </div>
+
+        <section class="distribution-task">
+          <div class="distribution-task-controls">
+            <label>
+              <span>Task</span>
+              <select id="distTask"></select>
+            </label>
+            <span id="distTaskKind" class="distribution-kind"></span>
+            <p id="distTaskDescription"></p>
+          </div>
+          <div class="distribution-table-wrap">
+            <table>
+              <thead><tr><th>Semantic outcome</th><th>Exact weight</th><th>Target</th></tr></thead>
+              <tbody id="distTargetBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <div class="distribution-configs">
+          <fieldset class="evaluation-config distribution-config">
+            <legend>Configuration A · Temperature baseline</legend>
+            <div class="evaluation-config-grid">
+              <label>
+                <span>Profile</span>
+                <select id="distProfileA">
+                  <option value="none">None</option>
+                  <option value="temperature" selected>Temperature</option>
+                  <option value="exponential">Exponential</option>
+                  <option value="soliton">Soliton</option>
+                  <option value="power">Power</option>
+                  <option value="half-normal">Half-normal</option>
+                </select>
+              </label>
+              <label><span>Diversity</span><input id="distDiversityA" type="number" min="0" max="200" step="1" value="188"></label>
+              <label>
+                <span>Candidate cap</span>
+                <select id="distCapA">
+                  <option>32</option><option selected>64</option><option>128</option><option>256</option>
+                  <option>512</option><option>1024</option><option>2048</option><option>4096</option>
+                </select>
+              </label>
+              <label>
+                <span>Min-P floor</span>
+                <select id="distFloorA">
+                  <option value="0" selected>Off</option><option value="0.001">0.1%</option><option value="0.005">0.5%</option>
+                  <option value="0.01">1%</option><option value="0.02">2%</option><option value="0.05">5%</option>
+                  <option value="0.1">10%</option>
+                </select>
+              </label>
+            </div>
+            <label class="check-control"><input id="distGuardA" type="checkbox" checked><span>Protocol guard</span></label>
+          </fieldset>
+
+          <fieldset class="evaluation-config distribution-config">
+            <legend>Configuration B · Soliton</legend>
+            <div class="evaluation-config-grid">
+              <label>
+                <span>Profile</span>
+                <select id="distProfileB">
+                  <option value="none">None</option>
+                  <option value="temperature">Temperature</option>
+                  <option value="exponential">Exponential</option>
+                  <option value="soliton" selected>Soliton</option>
+                  <option value="power">Power</option>
+                  <option value="half-normal">Half-normal</option>
+                </select>
+              </label>
+              <label><span>Diversity</span><input id="distDiversityB" type="number" min="0" max="200" step="1" value="188"></label>
+              <label>
+                <span>Candidate cap</span>
+                <select id="distCapB">
+                  <option>32</option><option selected>64</option><option>128</option><option>256</option>
+                  <option>512</option><option>1024</option><option>2048</option><option>4096</option>
+                </select>
+              </label>
+              <label>
+                <span>Min-P floor</span>
+                <select id="distFloorB">
+                  <option value="0" selected>Off</option><option value="0.001">0.1%</option><option value="0.005">0.5%</option>
+                  <option value="0.01">1%</option><option value="0.02">2%</option><option value="0.05">5%</option>
+                  <option value="0.1">10%</option>
+                </select>
+              </label>
+            </div>
+            <label class="check-control"><input id="distGuardB" type="checkbox" checked><span>Protocol guard</span></label>
+          </fieldset>
+        </div>
+
+        <section class="distribution-runner">
+          <div class="distribution-run-options">
+            <label><span>Balanced blocks</span><input id="distBlocks" type="number" min="1" max="10" step="1" value="1"></label>
+            <label><span>Projected draws / mapping</span><input id="distDraws" type="number" min="0" max="1000000" step="1000" value="10000"></label>
+            <label><span>Base seed</span><input id="distSeed" type="number" min="0" max="4294967295" step="1" value="1234"></label>
+            <label class="check-control" title="Keep candidate cap, Min-P, and protocol guard matched">
+              <input id="distLockSupport" type="checkbox" checked><span>Lock A/B support</span>
+            </label>
+          </div>
+          <details class="distribution-advanced">
+            <summary>Advanced prompt protocol</summary>
+            <label class="check-control">
+              <input id="distAutoPrefix" type="checkbox" checked>
+              <span>Auto-select a tokenizer-compatible label boundary</span>
+            </label>
+            <label><span>Preferred assistant prefix</span><input id="distPrefix" type="text" maxlength="128" value="Answer: "></label>
+            <p>The preferred prefix is used when possible. Automatic mode records and displays any compatible fallback selected for the active tokenizer.</p>
+          </details>
+          <div class="distribution-run-actions">
+            <button id="distStart" class="primary" type="button">Run balanced block</button>
+            <button id="distStop" class="secondary" type="button" disabled>Stop run</button>
+            <button id="distClear" class="secondary danger" type="button">Clear saved run</button>
+          </div>
+          <div class="evaluation-progress">
+            <strong id="distRunStatus">Ready to measure.</strong>
+            <span id="distProgress"></span>
+          </div>
+        </section>
+
+        <div id="distWarnings" class="distribution-warnings" hidden></div>
+
+        <section id="distResults" class="distribution-results" hidden>
+          <div class="distribution-results-heading">
+            <div>
+              <h2>Aggregate distribution evidence</h2>
+              <p id="distResultCaption"></p>
+            </div>
+            <div class="distribution-export-actions">
+              <button id="distExportJson" class="secondary" type="button">Export JSON</button>
+              <button id="distExportCsv" class="secondary" type="button">Export CSV</button>
+            </div>
+          </div>
+
+          <div class="distribution-table-wrap">
+            <table class="distribution-summary-table">
+              <thead>
+                <tr>
+                  <th>Stage</th><th>Open TV</th><th>Conditional TV</th><th>Open JS distance</th><th>Valid / invalid</th>
+                  <th>Missing target</th><th>Order</th><th>Task entropy error</th><th>Mean mapping TV · open / conditional</th><th>Mapping sensitivity</th>
+                </tr>
+              </thead>
+              <tbody id="distSummaryBody"></tbody>
+            </table>
+          </div>
+
+          <div class="distribution-chart-heading">
+            <h2>Semantic outcome probabilities</h2>
+            <small>Separate panels with a shared probability scale</small>
+          </div>
+          <div class="distribution-chart-grid">
+            <article class="distribution-chart-card target">
+              <h3>Target</h3>
+              <canvas id="distChartTarget" aria-label="Target semantic-outcome probability bars"></canvas>
+            </article>
+            <article class="distribution-chart-card raw">
+              <h3>Full raw conditional</h3>
+              <canvas id="distChartRaw" aria-label="Full raw conditional semantic-outcome probability bars"></canvas>
+            </article>
+            <article class="distribution-chart-card config-a">
+              <h3 id="distChartTitleA">A shaped conditional</h3>
+              <canvas id="distChartA" aria-label="Configuration A shaped conditional semantic-outcome probability bars"></canvas>
+            </article>
+            <article class="distribution-chart-card config-b">
+              <h3 id="distChartTitleB">B shaped conditional</h3>
+              <canvas id="distChartB" aria-label="Configuration B shaped conditional semantic-outcome probability bars"></canvas>
+            </article>
+          </div>
+          <div id="distMassBars" class="distribution-mass-bars"></div>
+
+          <div class="distribution-table-wrap">
+            <table>
+              <thead>
+                <tr><th>Outcome</th><th>Target</th><th>Full raw</th><th>A shaped</th><th>B shaped</th><th>A projected</th><th>B projected</th></tr>
+              </thead>
+              <tbody id="distOutcomeBody"></tbody>
+            </table>
+          </div>
+
+          <details class="distribution-mappings">
+            <summary>Per-mapping labels, tokens, probabilities, and diagnostics</summary>
+            <div class="distribution-table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Mapping</th><th>Outcome</th><th>Label</th><th>Token</th><th>Full raw</th><th>A shaped</th><th>B shaped</th><th>Retained A / B</th></tr>
+                </thead>
+                <tbody id="distMappingBody"></tbody>
+              </table>
+            </div>
+            <pre id="distInvalidTokens" class="distribution-invalid-tokens"></pre>
+          </details>
+        </section>
+      </div>
+    </details>
+
     <details class="evaluation panel">
       <summary>
         <span>

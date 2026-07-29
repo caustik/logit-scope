@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 #include <array>
 
 namespace logit_scope
@@ -55,6 +56,123 @@ struct EvaluationResult
     int token_count = 0;
 };
 
+struct DistributionOutcomeRequest
+{
+    std::string id;
+    std::string text;
+    std::string label;
+    double target_probability = 0.0;
+};
+
+struct DistributionConfigurationRequest
+{
+    std::string id;
+    std::string name;
+    ShapeSettings settings;
+};
+
+struct DistributionProbeRequest
+{
+    std::string prompt;
+    std::string assistant_prefix = "Answer: ";
+    bool auto_select_assistant_prefix = true;
+    std::string mapping_id;
+    std::vector<DistributionOutcomeRequest> outcomes;
+    std::vector<DistributionConfigurationRequest> configurations;
+    std::size_t sample_count = 10000;
+    std::uint32_t seed = 1234;
+};
+
+struct DistributionDistanceMetrics
+{
+    bool valid = true;
+    double total_variation = 0.0;
+    double js_divergence_nats = 0.0;
+    double js_distance_normalized = 0.0;
+    double valid_mass = 0.0;
+    double invalid_mass = 0.0;
+    double conditional_entropy = 0.0;
+    double conditional_entropy_error = 0.0;
+    double pairwise_order_accuracy = 0.0;
+    double missing_target_mass = 0.0;
+};
+
+struct DistributionOutcomeResult
+{
+    std::string id;
+    std::string text;
+    std::string label;
+    int token_id = -1;
+    double target_probability = 0.0;
+    double probability = 0.0;
+    bool retained = false;
+    int rank = -1;
+    std::uint64_t projected_count = 0;
+};
+
+struct DistributionTokenResult
+{
+    int token_id = -1;
+    std::string text;
+    double probability = 0.0;
+    int rank = -1;
+};
+
+struct DistributionStageResult
+{
+    std::vector<DistributionOutcomeResult> outcomes;
+    std::vector<DistributionTokenResult> top_invalid_tokens;
+    DistributionDistanceMetrics open_metrics;
+    DistributionDistanceMetrics conditional_metrics;
+    std::uint64_t projected_invalid_count = 0;
+};
+
+struct DistributionSamplerDiagnostics
+{
+    int support_size = 0;
+    double retained_probability_mass = 0.0;
+    double sampler_raw_entropy = 0.0;
+    double sampler_target_entropy = 0.0;
+    double sampler_shaped_entropy = 0.0;
+    double sampler_entropy_error = 0.0;
+    double raw_effective_choices = 0.0;
+    double target_effective_choices = 0.0;
+    double shaped_effective_choices = 0.0;
+    bool target_saturated = false;
+};
+
+struct DistributionConfigurationResult
+{
+    std::string id;
+    std::string name;
+    ShapeSettings settings;
+    DistributionStageResult retained_raw;
+    DistributionStageResult shaped;
+    DistributionSamplerDiagnostics diagnostics;
+};
+
+struct DistributionProbeResult
+{
+    std::uint64_t id = 0;
+    bool generating = false;
+    bool ready = false;
+    std::string status;
+    std::string prompt;
+    std::string formatted_prompt;
+    std::string requested_assistant_prefix;
+    std::string assistant_prefix;
+    std::string label_token_prefix;
+    bool assistant_prefix_auto_selected = false;
+    std::string mapping_id;
+    std::string model_path;
+    int prompt_token_count = 0;
+    std::size_t sample_count = 0;
+    std::uint32_t seed = 0;
+    double task_target_entropy = 0.0;
+    DistributionStageResult full_raw;
+    std::vector<DistributionConfigurationResult> configurations;
+};
+
 class Engine
 {
   public:
@@ -68,6 +186,7 @@ class Engine
     void stop();
     bool submit_message(std::string message);
     std::uint64_t submit_evaluation(std::string prompt, const ShapeSettings& settings);
+    std::uint64_t submit_distribution(DistributionProbeRequest request);
     void cancel_generation();
     void clear_conversation();
 
@@ -76,6 +195,7 @@ class Engine
     SamplingSnapshot snapshot() const;
     SamplingSnapshot preview_snapshot(const ShapeSettings& settings) const;
     EvaluationResult evaluation_result() const;
+    DistributionProbeResult distribution_result() const;
 
   private:
     class Impl;

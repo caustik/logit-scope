@@ -8,7 +8,14 @@ const elements = Object.fromEntries([
   "evalProgress", "evalJudge", "evalTrialLabel", "evalPromptDisplay", "evalNext", "evalLeftResponse", "evalRightResponse",
   "evalLeftMetrics", "evalRightMetrics", "evalRubric", "evalTaskLeft", "evalTaskRight", "evalCoherenceLeft",
   "evalCoherenceRight", "evalStyleLeft", "evalStyleRight", "evalNotes", "evalSubmitJudgment", "evalReveal",
-  "evalSummary", "evalExperiment", "evalSummaryBody", "evalExportJson", "evalExportCsv", "evalDelete"
+  "evalSummary", "evalExperiment", "evalSummaryBody", "evalExportJson", "evalExportCsv", "evalDelete",
+  "distTask", "distTaskKind", "distTaskDescription", "distTargetBody", "distProfileA", "distDiversityA", "distCapA",
+  "distFloorA", "distGuardA", "distProfileB", "distDiversityB", "distCapB", "distFloorB", "distGuardB", "distBlocks",
+  "distDraws", "distSeed", "distLockSupport", "distAutoPrefix", "distPrefix", "distStart", "distStop", "distClear",
+  "distRunStatus", "distProgress", "distWarnings", "distResults", "distResultCaption", "distExportJson", "distExportCsv",
+  "distSummaryBody",
+  "distChartTarget", "distChartRaw", "distChartA", "distChartB", "distChartTitleA", "distChartTitleB", "distMassBars",
+  "distOutcomeBody", "distMappingBody", "distInvalidTokens"
 ].map(id => [id, document.getElementById(id)]));
 
 let snapshot = null;
@@ -24,11 +31,15 @@ let evaluationDefaultsInitialized = false;
 let evaluationRunning = false;
 let evaluationCancelRequested = false;
 let currentEvaluationTrialId = null;
+let distributionRunning = false;
+let distributionCancelRequested = false;
 const maximumDisplayPointCount = 64;
 const evaluationStorageKey = "logit-scope-evaluations-v1";
 const evaluationActiveKey = "logit-scope-active-evaluation-v1";
+const distributionStorageKey = "logit-scope-distributions-v1";
 let evaluationStore = loadEvaluationStore();
 let activeEvaluationId = loadActiveEvaluationId();
+let activeDistributionRun = loadDistributionRun();
 
 async function request(path, options = {}) {
   const response = await fetch(path, {
@@ -353,14 +364,16 @@ function applySnapshot(next) {
   elements.selectedToken.textContent = view?.preview ? "Illustrative rank curve" : data ? view.selectedToken || "—" : "—";
   elements.selectedTokenLabel.textContent = view?.preview ? "Preview" :
     view?.representativeSampling ? "Most uncertain token" : "Selected token";
-  updateTranscript(evaluationRunning ? "Blind comparison in progress. Responses stay concealed until each pair is ready." : next.transcript || "");
+  updateTranscript(evaluationRunning ? "Blind comparison in progress. Responses stay concealed until each pair is ready." :
+    distributionRunning ? "Distribution Lab is measuring exact next-token probabilities in an isolated context." : next.transcript || "");
 
-  const canSend = next.modelLoaded && !next.generating && !evaluationRunning;
+  const canSend = next.modelLoaded && !next.generating && !evaluationRunning && !distributionRunning;
   elements.send.disabled = !canSend;
   elements.message.disabled = !canSend;
-  elements.stop.disabled = !next.generating;
-  elements.clear.disabled = !next.modelLoaded;
-  elements.evalStart.disabled = evaluationRunning || !next.modelLoaded || next.generating;
+  elements.stop.disabled = !next.generating || evaluationRunning || distributionRunning;
+  elements.clear.disabled = !next.modelLoaded || evaluationRunning || distributionRunning;
+  elements.evalStart.disabled = evaluationRunning || distributionRunning || !next.modelLoaded || next.generating;
+  elements.distStart.disabled = distributionRunning || evaluationRunning || !next.modelLoaded || next.generating;
   drawPlot();
 }
 
@@ -532,6 +545,7 @@ function setEvaluationRunning(running) {
   elements.evalStart.disabled = running || !snapshot?.modelLoaded || snapshot?.generating;
   elements.evalCancel.disabled = !running;
   elements.evalDelete.disabled = running || !activeEvaluation();
+  elements.distStart.disabled = running || distributionRunning || !snapshot?.modelLoaded || snapshot?.generating;
   if (!running) {
     updateControlLabels();
     updateEvaluationConfigControls("A");
@@ -575,7 +589,7 @@ function responseMetrics(response, tokenCount) {
 }
 
 async function startEvaluation() {
-  if (evaluationRunning) return;
+  if (evaluationRunning || distributionRunning) return;
   const prompts = parseEvaluationPrompts();
   const repeats = Math.max(1, Math.min(10, Number(elements.evalRepeats.value) || 1));
   const seedStart = Math.max(0, Math.min(4294967295, Number(elements.evalSeedStart.value) || 0));
@@ -940,6 +954,921 @@ function deleteActiveEvaluation() {
   showNextUnjudgedTrial();
 }
 
+const distributionTasks = [
+  {
+    id: "two-dice-sum",
+    name: "Sum of two fair six-sided dice",
+    kind: "implicit",
+    description: "Two independent fair six-sided dice are rolled. The outcome is their sum.",
+    outcomes: [1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1].map((weight, index) =>
+      ({ id: `sum-${index + 2}`, text: `sum ${index + 2}`, weight }))
+  },
+  {
+    id: "four-coin-heads",
+    name: "Number of heads in four fair tosses",
+    kind: "implicit",
+    description: "A fair coin is tossed independently four times. The outcome is the total number of heads.",
+    outcomes: [1, 4, 6, 4, 1].map((weight, heads) =>
+      ({ id: `heads-${heads}`, text: `${heads} ${heads === 1 ? "head" : "heads"}`, weight }))
+  },
+  {
+    id: "two-dice-maximum",
+    name: "Maximum of two fair six-sided dice",
+    kind: "implicit",
+    description: "Two independent fair six-sided dice are rolled. The outcome is the larger of the two values.",
+    outcomes: [1, 3, 5, 7, 9, 11].map((weight, index) =>
+      ({ id: `maximum-${index + 1}`, text: `maximum ${index + 1}`, weight }))
+  },
+  {
+    id: "first-head-three-tosses",
+    name: "First head position in three fair tosses",
+    kind: "implicit",
+    description: "A fair coin is tossed up to three times. The outcome is the toss on which the first head appears, or no heads.",
+    outcomes: [
+      { id: "head-1", text: "head on toss 1", weight: 4 },
+      { id: "head-2", text: "head on toss 2", weight: 2 },
+      { id: "head-3", text: "head on toss 3", weight: 1 },
+      { id: "no-heads", text: "no heads", weight: 1 }
+    ]
+  },
+  {
+    id: "explicit-five-way-control",
+    name: "Explicit 8:4:2:1:1 control",
+    kind: "control",
+    description: "A calibrated source emits outcome one, two, three, four, or five with relative frequencies 8, 4, 2, 1, and 1 respectively.",
+    outcomes: [8, 4, 2, 1, 1].map((weight, index) =>
+      ({ id: `control-${index + 1}`, text: `outcome ${index + 1}`, weight }))
+  }
+];
+
+function loadDistributionRun() {
+  try {
+    const run = JSON.parse(window.localStorage.getItem(distributionStorageKey));
+    if (run?.version === 1 && Array.isArray(run.mappings) && Array.isArray(run.probes)) {
+      if (run.status === "running") run.status = "paused";
+      if (run.autoSelectAssistantPrefix === undefined) run.autoSelectAssistantPrefix = true;
+      run.nextMappingIndex = Math.max(run.nextMappingIndex || 0, run.probes.length);
+      return run;
+    }
+  } catch {
+    // A malformed or unavailable local store should not block the application.
+  }
+  return null;
+}
+
+function saveDistributionRun() {
+  try {
+    if (activeDistributionRun)
+      window.localStorage.setItem(distributionStorageKey, JSON.stringify(activeDistributionRun));
+    else
+      window.localStorage.removeItem(distributionStorageKey);
+  } catch (error) {
+    elements.error.textContent = `Distribution results could not be saved: ${error.message}`;
+  }
+}
+
+function selectedDistributionTask() {
+  return distributionTasks.find(task => task.id === elements.distTask.value) || distributionTasks[0];
+}
+
+function normalizedTaskOutcomes(task) {
+  const total = task.outcomes.reduce((sum, outcome) => sum + outcome.weight, 0);
+  return task.outcomes.map(outcome => ({ ...outcome, targetProbability: outcome.weight / total }));
+}
+
+function renderDistributionTask() {
+  const task = selectedDistributionTask();
+  elements.distTaskKind.textContent = task.kind === "control" ? "Explicit control" : "Implicit probability task";
+  elements.distTaskKind.className = `distribution-kind${task.kind === "control" ? " control" : ""}`;
+  elements.distTaskDescription.textContent = task.description;
+  elements.distTargetBody.replaceChildren();
+  for (const outcome of normalizedTaskOutcomes(task)) {
+    const row = document.createElement("tr");
+    appendEvaluationCell(row, outcome.text);
+    appendEvaluationCell(row, String(outcome.weight));
+    appendEvaluationCell(row, percentage(outcome.targetProbability, 2));
+    elements.distTargetBody.append(row);
+  }
+}
+
+function createSeededRandom(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function distributionGreatestCommonDivisor(a, b) {
+  let lhs = Math.abs(a);
+  let rhs = Math.abs(b);
+  while (rhs !== 0) {
+    const next = lhs % rhs;
+    lhs = rhs;
+    rhs = next;
+  }
+  return lhs;
+}
+
+function distributionShuffle(values, random) {
+  const result = values.slice();
+  for (let index = result.length - 1; index > 0; --index) {
+    const other = Math.floor(random() * (index + 1));
+    [result[index], result[other]] = [result[other], result[index]];
+  }
+  return result;
+}
+
+function distributionCoprimeStride(size, random) {
+  if (size <= 2) return 1;
+  const candidates = [];
+  for (let stride = 1; stride < size; ++stride) {
+    if (distributionGreatestCommonDivisor(stride, size) === 1) candidates.push(stride);
+  }
+  return candidates[Math.floor(random() * candidates.length)];
+}
+
+function createBalancedDistributionMappings(outcomes, blockCount, seed) {
+  const labels = Array.from({ length: outcomes.length }, (_, index) => String.fromCharCode(65 + index));
+  const mappings = [];
+  const size = outcomes.length;
+  for (let block = 0; block < blockCount; ++block) {
+    const random = createSeededRandom((seed + block) >>> 0);
+    const baseOutcomes = distributionShuffle(outcomes, random);
+    const baseLabels = distributionShuffle(labels, random);
+    const stride = distributionCoprimeStride(size, random);
+    for (let rotation = 0; rotation < size; ++rotation) {
+      const assignedLabelByOutcomeId = new Map();
+      for (let index = 0; index < size; ++index)
+        assignedLabelByOutcomeId.set(outcomes[index].id, baseLabels[(index + rotation) % size]);
+      const displayOffset = (rotation * stride) % size;
+      const rows = [];
+      for (let position = 0; position < size; ++position) {
+        const outcome = baseOutcomes[(position + displayOffset) % size];
+        rows.push({ position, outcomeId: outcome.id, label: assignedLabelByOutcomeId.get(outcome.id) });
+      }
+      mappings.push({ id: `${block}:${rotation}`, block, rotation, stride, rows });
+    }
+  }
+  return mappings;
+}
+
+function verifyBalancedDistributionBlock(mappings, outcomes, block) {
+  const blockMappings = mappings.filter(mapping => mapping.block === block);
+  if (blockMappings.length !== outcomes.length) throw new Error("Balanced block has the wrong number of mappings");
+  const expectedLabels = outcomes.length;
+  for (const outcome of outcomes) {
+    const labels = new Set();
+    const positions = new Set();
+    for (const mapping of blockMappings) {
+      const row = mapping.rows.find(value => value.outcomeId === outcome.id);
+      if (!row) throw new Error(`Mapping omitted outcome ${outcome.id}`);
+      labels.add(row.label);
+      positions.add(row.position);
+    }
+    if (labels.size !== expectedLabels) throw new Error(`Outcome ${outcome.id} did not receive every label`);
+    if (positions.size !== outcomes.length) throw new Error(`Outcome ${outcome.id} did not occupy every position`);
+  }
+}
+
+function distributionField(side, name) {
+  return elements[`dist${name}${side}`];
+}
+
+function distributionSettings(side, seed = Number(elements.distSeed.value) || 0) {
+  return {
+    profile: distributionField(side, "Profile").value,
+    diversity: Math.max(0, Math.min(2, Number(distributionField(side, "Diversity").value) / 100)),
+    candidateCap: Number(distributionField(side, "Cap").value),
+    minimumRelativeProbability: Number(distributionField(side, "Floor").value),
+    seed,
+    protectControlTokens: distributionField(side, "Guard").checked
+  };
+}
+
+function updateDistributionConfigControls() {
+  for (const side of ["A", "B"])
+    distributionField(side, "Diversity").disabled = distributionRunning || distributionField(side, "Profile").value === "none";
+  const supportLocked = elements.distLockSupport.checked;
+  for (const name of ["Cap", "Floor", "Guard"]) distributionField("B", name).disabled = distributionRunning || supportLocked;
+}
+
+function synchronizeDistributionSupport() {
+  if (!elements.distLockSupport.checked) {
+    updateDistributionConfigControls();
+    return;
+  }
+  distributionField("B", "Cap").value = distributionField("A", "Cap").value;
+  distributionField("B", "Floor").value = distributionField("A", "Floor").value;
+  distributionField("B", "Guard").checked = distributionField("A", "Guard").checked;
+  updateDistributionConfigControls();
+}
+
+function buildDistributionPrompt(task, mapping) {
+  const outcomes = new Map(task.outcomes.map(outcome => [outcome.id, outcome]));
+  const mappingLines = mapping.rows.map(row => `${row.label} = ${outcomes.get(row.outcomeId).text}`).join("\n");
+  return `${task.description}
+
+The possible outcomes are represented by opaque labels:
+${mappingLines}
+
+Simulate one independent occurrence of this process and return the label for its outcome. Sample according to the true probability distribution implied by the process. Do not merely choose the most likely outcome. Do not explain, show calculations, list probabilities, or add punctuation.
+
+Return exactly one label.`;
+}
+
+function createDistributionRun() {
+  const task = selectedDistributionTask();
+  const outcomes = normalizedTaskOutcomes(task);
+  const blocks = Math.max(1, Math.min(10, Number(elements.distBlocks.value) || 1));
+  const sampleCount = Math.max(0, Math.min(1000000, Number(elements.distDraws.value) || 0));
+  const seed = Math.max(0, Math.min(4294967295, Number(elements.distSeed.value) || 0));
+  const assistantPrefix = elements.distPrefix.value;
+  const mappings = createBalancedDistributionMappings(outcomes, blocks, seed);
+  for (let block = 0; block < blocks; ++block) verifyBalancedDistributionBlock(mappings, outcomes, block);
+  const settingsA = distributionSettings("A", seed);
+  const settingsB = distributionSettings("B", seed);
+  return {
+    version: 1,
+    id: createEvaluationId(),
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    status: "running",
+    error: null,
+    task: { ...task, outcomes },
+    blocks,
+    sampleCount,
+    seed,
+    assistantPrefix,
+    autoSelectAssistantPrefix: elements.distAutoPrefix.checked,
+    supportLocked: elements.distLockSupport.checked,
+    configurations: [
+      { id: "A", name: profileDisplayName(settingsA.profile), settings: settingsA },
+      { id: "B", name: profileDisplayName(settingsB.profile), settings: settingsB }
+    ],
+    mappings,
+    nextMappingIndex: 0,
+    probes: []
+  };
+}
+
+function setDistributionRunning(running) {
+  distributionRunning = running;
+  const setupControls = [
+    "distTask", "distProfileA", "distDiversityA", "distCapA", "distFloorA", "distGuardA", "distProfileB",
+    "distDiversityB", "distCapB", "distFloorB", "distGuardB", "distBlocks", "distDraws", "distSeed",
+    "distLockSupport", "distAutoPrefix", "distPrefix"
+  ];
+  const primaryControls = [
+    "profile", "diversity", "candidateCap", "minimumRelativeProbability", "seed", "protectControlTokens", "message",
+    "clear", "send", "evalStart"
+  ];
+  for (const id of [...setupControls, ...primaryControls]) elements[id].disabled = running;
+  elements.distStart.disabled = running || evaluationRunning || !snapshot?.modelLoaded || snapshot?.generating;
+  elements.distStop.disabled = !running;
+  elements.distClear.disabled = running || !activeDistributionRun;
+  if (!running) {
+    updateControlLabels();
+    updateDistributionConfigControls();
+    if (snapshot) applySnapshot(snapshot);
+  }
+}
+
+async function submitDistributionMapping(run, mapping) {
+  const outcomesById = new Map(run.task.outcomes.map(outcome => [outcome.id, outcome]));
+  const labelsByOutcomeId = new Map(mapping.rows.map(row => [row.outcomeId, row.label]));
+  const mappingId = `${run.task.id}:block-${mapping.block}:rotation-${mapping.rotation}`;
+  const accepted = await request("/api/distribution", {
+    method: "POST",
+    body: JSON.stringify({
+      prompt: buildDistributionPrompt(run.task, mapping),
+      assistantPrefix: run.assistantPrefix,
+      autoSelectAssistantPrefix: run.autoSelectAssistantPrefix,
+      mappingId,
+      sampleCount: run.sampleCount,
+      seed: run.seed,
+      outcomes: run.task.outcomes.map(outcome => ({
+        id: outcome.id,
+        text: outcome.text,
+        label: labelsByOutcomeId.get(outcome.id),
+        targetProbability: outcomesById.get(outcome.id).targetProbability
+      })),
+      configurations: run.configurations
+    })
+  });
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < deadline) {
+    if (distributionCancelRequested) throw new Error("Distribution run stopped");
+    const result = await request("/api/distribution");
+    if (result.id === accepted.id && result.ready) return result;
+    await evaluationDelay(85);
+  }
+  throw new Error("Distribution probe timed out");
+}
+
+async function startDistributionRun() {
+  if (distributionRunning || evaluationRunning) return;
+  if (!snapshot?.modelLoaded || snapshot.generating) {
+    elements.error.textContent = "The model must be ready before starting Distribution Lab.";
+    return;
+  }
+  if (!elements.distPrefix.value) {
+    elements.error.textContent = "Assistant prefix must not be empty.";
+    return;
+  }
+
+  const resumable = activeDistributionRun && ["paused", "stopped"].includes(activeDistributionRun.status) &&
+    activeDistributionRun.nextMappingIndex < activeDistributionRun.mappings.length;
+  if (!resumable) activeDistributionRun = createDistributionRun();
+  activeDistributionRun.status = "running";
+  activeDistributionRun.error = null;
+  distributionCancelRequested = false;
+  saveDistributionRun();
+  setDistributionRunning(true);
+  renderDistributionResults();
+  elements.error.textContent = "";
+
+  try {
+    while (activeDistributionRun.nextMappingIndex < activeDistributionRun.mappings.length) {
+      if (distributionCancelRequested) throw new Error("Distribution run stopped");
+      const mappingIndex = activeDistributionRun.nextMappingIndex;
+      const mapping = activeDistributionRun.mappings[mappingIndex];
+      elements.distRunStatus.textContent =
+        `Measuring block ${mapping.block + 1}, rotation ${mapping.rotation + 1}…`;
+      elements.distProgress.textContent = `${mappingIndex + 1} / ${activeDistributionRun.mappings.length} probes`;
+      const result = await submitDistributionMapping(activeDistributionRun, mapping);
+      if (result.status !== "Complete") {
+        activeDistributionRun.failedProbe = { mapping, result };
+        throw new Error(result.status);
+      }
+      activeDistributionRun.probes.push({ mapping, result });
+      activeDistributionRun.nextMappingIndex = mappingIndex + 1;
+      saveDistributionRun();
+      renderDistributionResults();
+    }
+    activeDistributionRun.status = "complete";
+    activeDistributionRun.completedAt = new Date().toISOString();
+    elements.distRunStatus.textContent = "Balanced distribution run complete.";
+    elements.distProgress.textContent = `${activeDistributionRun.probes.length} exact shared-logits probes`;
+  } catch (error) {
+    activeDistributionRun.status = distributionCancelRequested ? "stopped" : "error";
+    activeDistributionRun.error = error.message;
+    elements.distRunStatus.textContent = distributionCancelRequested ? "Run stopped; completed probes were saved." : "Distribution run failed.";
+    elements.distProgress.textContent = `${activeDistributionRun.probes.length} / ${activeDistributionRun.mappings.length} probes complete`;
+    if (!distributionCancelRequested) elements.error.textContent = error.message;
+  } finally {
+    saveDistributionRun();
+    setDistributionRunning(false);
+    renderDistributionResults();
+  }
+}
+
+function stopDistributionRun() {
+  if (!distributionRunning) return;
+  distributionCancelRequested = true;
+  elements.distRunStatus.textContent = "Stopping the active probe…";
+  request("/api/stop", { method: "POST", body: "{}" }).catch(error => elements.error.textContent = error.message);
+}
+
+function clearDistributionRun() {
+  if (distributionRunning || !activeDistributionRun) return;
+  if (!window.confirm("Clear the saved Distribution Lab run from this browser?")) return;
+  activeDistributionRun = null;
+  saveDistributionRun();
+  renderDistributionResults();
+}
+
+function distributionNormalize(values) {
+  const total = values.reduce((sum, value) => sum + value, 0);
+  return total > 0 ? values.map(value => value / total) : null;
+}
+
+function distributionEntropy(values) {
+  const normalized = distributionNormalize(values);
+  if (!normalized) return null;
+  return -normalized.reduce((sum, value) => sum + (value > 0 ? value * Math.log(value) : 0), 0);
+}
+
+function distributionTotalVariation(left, right) {
+  const lhs = distributionNormalize(left);
+  const rhs = distributionNormalize(right);
+  if (!lhs || !rhs || lhs.length !== rhs.length) return null;
+  return 0.5 * lhs.reduce((sum, value, index) => sum + Math.abs(value - rhs[index]), 0);
+}
+
+function distributionJensenShannon(left, right) {
+  const lhs = distributionNormalize(left);
+  const rhs = distributionNormalize(right);
+  if (!lhs || !rhs || lhs.length !== rhs.length) return null;
+  let divergence = 0;
+  for (let index = 0; index < lhs.length; ++index) {
+    const midpoint = 0.5 * (lhs[index] + rhs[index]);
+    if (lhs[index] > 0) divergence += 0.5 * lhs[index] * Math.log(lhs[index] / midpoint);
+    if (rhs[index] > 0) divergence += 0.5 * rhs[index] * Math.log(rhs[index] / midpoint);
+  }
+  return divergence;
+}
+
+function distributionPairwiseOrderAccuracy(predicted, target) {
+  const normalizedPredicted = distributionNormalize(predicted);
+  const normalizedTarget = distributionNormalize(target);
+  if (!normalizedPredicted || !normalizedTarget) return null;
+  let score = 0;
+  let pairs = 0;
+  for (let left = 0; left < target.length; ++left) {
+    for (let right = left + 1; right < target.length; ++right) {
+      const targetDifference = normalizedTarget[left] - normalizedTarget[right];
+      if (targetDifference === 0) continue;
+      const predictedDifference = normalizedPredicted[left] - normalizedPredicted[right];
+      ++pairs;
+      if (predictedDifference === 0) score += 0.5;
+      else if ((predictedDifference > 0) === (targetDifference > 0)) score += 1;
+    }
+  }
+  return pairs ? score / pairs : 1;
+}
+
+function distributionStandardDeviation(values) {
+  if (!values.length) return null;
+  const mean = average(values);
+  return Math.sqrt(average(values.map(value => Math.pow(value - mean, 2))));
+}
+
+function distributionStageDescriptors(run) {
+  const configA = run.configurations.find(configuration => configuration.id === "A");
+  const configB = run.configurations.find(configuration => configuration.id === "B");
+  const configuration = (probe, id) => probe.result.configurations.find(value => value.id === id);
+  return [
+    { key: "fullRaw", label: "Full raw model", className: "full-raw", stage: probe => probe.result.fullRaw },
+    {
+      key: "retainedA", label: `Retained raw A · ${configA.name}`, className: "config-a",
+      configurationId: "A", stage: probe => configuration(probe, "A")?.retainedRaw
+    },
+    {
+      key: "shapedA", label: `Shaped A · ${configA.name}`, className: "config-a",
+      configurationId: "A", shaped: true, stage: probe => configuration(probe, "A")?.shaped
+    },
+    {
+      key: "retainedB", label: `Retained raw B · ${configB.name}`, className: "config-b",
+      configurationId: "B", stage: probe => configuration(probe, "B")?.retainedRaw
+    },
+    {
+      key: "shapedB", label: `Shaped B · ${configB.name}`, className: "config-b",
+      configurationId: "B", shaped: true, stage: probe => configuration(probe, "B")?.shaped
+    }
+  ];
+}
+
+function aggregateDistributionStage(run, descriptor) {
+  const stages = run.probes.map(probe => descriptor.stage(probe)).filter(Boolean);
+  if (!stages.length) return null;
+  const target = run.task.outcomes.map(outcome => outcome.targetProbability);
+  const pooled = run.task.outcomes.map(outcome =>
+    average(stages.map(stage => stage.outcomes.find(value => value.id === outcome.id)?.probability || 0)));
+  const validMass = pooled.reduce((sum, value) => sum + value, 0);
+  const invalidMass = Math.max(0, 1 - validMass);
+  const conditional = distributionNormalize(pooled);
+  const targetEntropy = distributionEntropy(target);
+  const openPredicted = [...pooled, invalidMass];
+  const openTarget = [...target, 0];
+  const perMappingOpenTv = stages.map(stage => stage.openMetrics.totalVariation);
+  const perMappingConditionalTv = stages.filter(stage => stage.conditionalMetrics.valid)
+    .map(stage => stage.conditionalMetrics.totalVariation);
+  const conditionalVectors = stages.map(stage => distributionNormalize(
+    run.task.outcomes.map(outcome => stage.outcomes.find(value => value.id === outcome.id)?.probability || 0))).filter(Boolean);
+  const mappingDivergences = conditional && conditionalVectors.length ?
+    conditionalVectors.map(values => distributionJensenShannon(values, conditional)).filter(Number.isFinite) : [];
+  const mappingSensitivityDivergence = average(mappingDivergences);
+  return {
+    descriptor,
+    stages,
+    pooled,
+    conditional,
+    projected: run.task.outcomes.map(outcome => stages.reduce((sum, stage) =>
+      sum + (stage.outcomes.find(value => value.id === outcome.id)?.projectedCount || 0), 0)),
+    validMass,
+    invalidMass,
+    openTv: distributionTotalVariation(openPredicted, openTarget),
+    conditionalTv: conditional ? distributionTotalVariation(conditional, target) : null,
+    openJsd: distributionJensenShannon(openPredicted, openTarget),
+    openJsDistance: Math.sqrt((distributionJensenShannon(openPredicted, openTarget) || 0) / Math.log(2)),
+    orderAccuracy: conditional ? distributionPairwiseOrderAccuracy(conditional, target) : null,
+    entropyError: conditional ? distributionEntropy(conditional) - targetEntropy : null,
+    missingTargetMass: average(stages.map(stage => stage.openMetrics.missingTargetMass)),
+    meanMappingOpenTv: average(perMappingOpenTv),
+    standardDeviationOpenTv: distributionStandardDeviation(perMappingOpenTv),
+    meanMappingConditionalTv: average(perMappingConditionalTv),
+    standardDeviationConditionalTv: distributionStandardDeviation(perMappingConditionalTv),
+    mappingSensitivityDivergence,
+    mappingSensitivity: mappingSensitivityDivergence === null ? null :
+      Math.sqrt(mappingSensitivityDivergence / Math.log(2))
+  };
+}
+
+function distributionAggregates(run) {
+  return distributionStageDescriptors(run).map(descriptor => aggregateDistributionStage(run, descriptor)).filter(Boolean);
+}
+
+function formatDistributionMetric(value, digits = 4) {
+  return Number.isFinite(value) ? value.toFixed(digits) : "—";
+}
+
+function appendDistributionSummaryRow(aggregate) {
+  const row = document.createElement("tr");
+  row.className = aggregate.descriptor.className;
+  appendEvaluationCell(row, aggregate.descriptor.label);
+  appendEvaluationCell(row, formatDistributionMetric(aggregate.openTv));
+  appendEvaluationCell(row, formatDistributionMetric(aggregate.conditionalTv));
+  appendEvaluationCell(row, formatDistributionMetric(aggregate.openJsDistance));
+  appendEvaluationCell(row, `${percentage(aggregate.validMass)} / ${percentage(aggregate.invalidMass)}`);
+  appendEvaluationCell(row, percentage(aggregate.missingTargetMass));
+  appendEvaluationCell(row, percentage(aggregate.orderAccuracy));
+  appendEvaluationCell(row, Number.isFinite(aggregate.entropyError) ? `${aggregate.entropyError >= 0 ? "+" : ""}${aggregate.entropyError.toFixed(4)}` : "—");
+  appendEvaluationCell(row,
+    `${formatDistributionMetric(aggregate.meanMappingOpenTv)} ± ${formatDistributionMetric(aggregate.standardDeviationOpenTv)} / ` +
+    `${formatDistributionMetric(aggregate.meanMappingConditionalTv)} ± ${formatDistributionMetric(aggregate.standardDeviationConditionalTv)}`);
+  appendEvaluationCell(row, formatDistributionMetric(aggregate.mappingSensitivity));
+  elements.distSummaryBody.append(row);
+}
+
+function drawDistributionSeriesChart(canvas, run, values, color, maximum, emptyMessage) {
+  const rectangle = canvas.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(rectangle.width * ratio));
+  const height = Math.max(1, Math.round(rectangle.height * ratio));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  const context = canvas.getContext("2d");
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  const w = rectangle.width;
+  const h = rectangle.height;
+  context.clearRect(0, 0, w, h);
+  if (!run) return;
+
+  const margin = { left: 42, right: 8, top: 16, bottom: 66 };
+  const plotWidth = Math.max(1, w - margin.left - margin.right);
+  const plotHeight = Math.max(1, h - margin.top - margin.bottom);
+  context.font = "10px ui-sans-serif, system-ui";
+  for (let step = 0; step <= 4; ++step) {
+    const probability = maximum * step / 4;
+    const y = margin.top + plotHeight - probability / maximum * plotHeight;
+    context.strokeStyle = step === 0 ? "#45515e" : "#27313a";
+    context.beginPath();
+    context.moveTo(margin.left, y);
+    context.lineTo(w - margin.right, y);
+    context.stroke();
+    context.fillStyle = "#7f8d9a";
+    context.textAlign = "right";
+    context.textBaseline = "middle";
+    context.fillText(`${(probability * 100).toFixed(0)}%`, margin.left - 7, y);
+  }
+  const groupWidth = plotWidth / run.task.outcomes.length;
+  const barWidth = Math.max(3, Math.min(28, groupWidth * 0.56));
+  const hasValues = values.length === run.task.outcomes.length;
+  for (let outcomeIndex = 0; outcomeIndex < run.task.outcomes.length; ++outcomeIndex) {
+    const groupCenter = margin.left + groupWidth * (outcomeIndex + 0.5);
+    if (hasValues) {
+      const value = values[outcomeIndex] || 0;
+      const barHeight = value / maximum * plotHeight;
+      context.fillStyle = color;
+      context.fillRect(groupCenter - barWidth / 2, margin.top + plotHeight - barHeight, barWidth, barHeight);
+      if (groupWidth >= 42 && value > 0) {
+        context.fillStyle = "#c5d0da";
+        context.textAlign = "center";
+        context.textBaseline = "bottom";
+        context.font = "9px ui-sans-serif, system-ui";
+        context.fillText(`${(value * 100).toFixed(value < 0.1 ? 1 : 0)}%`, groupCenter,
+                         Math.max(margin.top + 9, margin.top + plotHeight - barHeight - 3));
+        context.font = "10px ui-sans-serif, system-ui";
+      }
+    }
+    context.save();
+    context.translate(groupCenter + 2, h - margin.bottom + 8);
+    context.rotate(-Math.PI / 4);
+    context.fillStyle = "#91a0ae";
+    context.textAlign = "right";
+    context.textBaseline = "middle";
+    const label = run.task.outcomes[outcomeIndex].text;
+    context.fillText(label.length > 18 ? `${label.slice(0, 17)}…` : label, 0, 0);
+    context.restore();
+  }
+  if (!hasValues && emptyMessage) {
+    context.fillStyle = "#c9985a";
+    context.font = "11px ui-sans-serif, system-ui";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText(emptyMessage, margin.left + plotWidth / 2, margin.top + plotHeight / 2, plotWidth - 24);
+  }
+}
+
+function drawDistributionCharts(run, aggregates) {
+  const byKey = new Map(aggregates.map(aggregate => [aggregate.descriptor.key, aggregate]));
+  const target = run ? run.task.outcomes.map(outcome => outcome.targetProbability) : [];
+  const configurationA = run?.configurations.find(configuration => configuration.id === "A");
+  const configurationB = run?.configurations.find(configuration => configuration.id === "B");
+  elements.distChartTitleA.textContent = configurationA ? `A shaped conditional · ${configurationA.name}` : "A shaped conditional";
+  elements.distChartTitleB.textContent = configurationB ? `B shaped conditional · ${configurationB.name}` : "B shaped conditional";
+  const charts = [
+    { canvas: elements.distChartTarget, values: target, color: "#b779ff" },
+    { canvas: elements.distChartRaw, values: byKey.get("fullRaw")?.conditional || [], color: "#43d0c1" },
+    { canvas: elements.distChartA, values: byKey.get("shapedA")?.conditional || [], color: "#ffd07a" },
+    { canvas: elements.distChartB, values: byKey.get("shapedB")?.conditional || [], color: "#ff9b42" }
+  ];
+  const rawMaximum = Math.max(0.05, ...charts.flatMap(chart => chart.values));
+  const maximum = Math.ceil(rawMaximum * 20) / 20;
+  for (const chart of charts)
+    drawDistributionSeriesChart(chart.canvas, run, chart.values, chart.color, maximum,
+                                "No valid label mass after support filtering");
+}
+
+function renderDistributionMassBars(aggregates) {
+  elements.distMassBars.replaceChildren();
+  for (const key of ["fullRaw", "shapedA", "shapedB"]) {
+    const aggregate = aggregates.find(value => value.descriptor.key === key);
+    if (!aggregate) continue;
+    const row = document.createElement("div");
+    row.className = "distribution-mass-row";
+    const label = document.createElement("span");
+    label.textContent = aggregate.descriptor.label;
+    const track = document.createElement("div");
+    track.className = "distribution-mass-track";
+    const valid = document.createElement("span");
+    valid.className = "distribution-mass-valid";
+    valid.style.width = `${Math.max(0, Math.min(100, aggregate.validMass * 100))}%`;
+    track.append(valid);
+    const value = document.createElement("strong");
+    value.textContent = `${percentage(aggregate.validMass)} valid`;
+    row.append(label, track, value);
+    elements.distMassBars.append(row);
+  }
+}
+
+function renderDistributionOutcomeTable(run, aggregates) {
+  elements.distOutcomeBody.replaceChildren();
+  const byKey = new Map(aggregates.map(aggregate => [aggregate.descriptor.key, aggregate]));
+  for (let index = 0; index < run.task.outcomes.length; ++index) {
+    const outcome = run.task.outcomes[index];
+    const row = document.createElement("tr");
+    appendEvaluationCell(row, outcome.text);
+    appendEvaluationCell(row, percentage(outcome.targetProbability, 2));
+    appendEvaluationCell(row, percentage(byKey.get("fullRaw")?.pooled[index]));
+    appendEvaluationCell(row, percentage(byKey.get("shapedA")?.pooled[index]));
+    appendEvaluationCell(row, percentage(byKey.get("shapedB")?.pooled[index]));
+    appendEvaluationCell(row, (byKey.get("shapedA")?.projected[index] || 0).toLocaleString());
+    appendEvaluationCell(row, (byKey.get("shapedB")?.projected[index] || 0).toLocaleString());
+    elements.distOutcomeBody.append(row);
+  }
+}
+
+function renderDistributionMappingTable(run) {
+  elements.distMappingBody.replaceChildren();
+  const invalidLines = [];
+  for (const probe of run.probes) {
+    const configA = probe.result.configurations.find(configuration => configuration.id === "A");
+    const configB = probe.result.configurations.find(configuration => configuration.id === "B");
+    for (const fullOutcome of probe.result.fullRaw.outcomes) {
+      const outcomeA = configA?.shaped.outcomes.find(value => value.id === fullOutcome.id);
+      const outcomeB = configB?.shaped.outcomes.find(value => value.id === fullOutcome.id);
+      const row = document.createElement("tr");
+      appendEvaluationCell(row, probe.result.mappingId);
+      appendEvaluationCell(row, fullOutcome.text);
+      appendEvaluationCell(row, fullOutcome.label);
+      appendEvaluationCell(row, String(fullOutcome.tokenId));
+      appendEvaluationCell(row, percentage(fullOutcome.probability));
+      appendEvaluationCell(row, percentage(outcomeA?.probability));
+      appendEvaluationCell(row, percentage(outcomeB?.probability));
+      appendEvaluationCell(row, `${outcomeA?.retained ? "yes" : "no"} / ${outcomeB?.retained ? "yes" : "no"}`);
+      elements.distMappingBody.append(row);
+    }
+    const tokenText = stage => stage.topInvalidTokens.slice(0, 5)
+      .map(token => `${JSON.stringify(token.text)} (${percentage(token.probability)}, rank ${token.rank + 1})`).join(", ");
+    invalidLines.push(`${probe.result.mappingId}
+  full raw: ${tokenText(probe.result.fullRaw)}
+  A shaped: ${tokenText(configA.shaped)}
+  B shaped: ${tokenText(configB.shaped)}`);
+  }
+  elements.distInvalidTokens.textContent = invalidLines.length ?
+    `Highest-probability invalid tokens\n\n${invalidLines.join("\n\n")}` : "";
+}
+
+function distributionSupportMatches(run) {
+  const [left, right] = run.configurations.map(configuration => configuration.settings);
+  return left.candidateCap === right.candidateCap &&
+    Math.abs(left.minimumRelativeProbability - right.minimumRelativeProbability) < 1e-12 &&
+    left.protectControlTokens === right.protectControlTokens;
+}
+
+function distributionWarnings(run, aggregates) {
+  const warnings = [];
+  if (run.error) warnings.push(run.error);
+  if (run.probes.length < run.mappings.length)
+    warnings.push(`Partial aggregate: ${run.probes.length} of ${run.mappings.length} balanced mappings are complete.`);
+  if (!distributionSupportMatches(run))
+    warnings.push("A and B use different candidate cap, Min-P, or protocol-guard settings; the comparison mixes support and shaping effects.");
+  const automaticBoundaries = [...new Map(run.probes
+    .filter(probe => probe.result.assistantPrefixAutoSelected)
+    .map(probe => {
+      const assistantPrefix = probe.result.assistantPrefix;
+      const labelTokenPrefix = probe.result.labelTokenPrefix || "";
+      return [`${assistantPrefix}\u0000${labelTokenPrefix}`, { assistantPrefix, labelTokenPrefix }];
+    })).values()];
+  if (automaticBoundaries.length) {
+    const descriptions = automaticBoundaries.map(boundary =>
+      `context ${JSON.stringify(boundary.assistantPrefix)} + label-token prefix ${JSON.stringify(boundary.labelTokenPrefix)}`);
+    warnings.push(`Tokenizer-compatible boundary selected automatically: ${descriptions.join(", ")}.`);
+  }
+  if (aggregates.some(aggregate => aggregate.missingTargetMass > 1e-9))
+    warnings.push("At least one valid outcome was pruned. Missing target mass contributes directly to the reported diagnostic.");
+  if (aggregates.some(aggregate => aggregate.validMass < 0.5))
+    warnings.push("Valid label mass is below 50% in at least one stage; conditional weighting may look good despite protocol failure.");
+  const configurations = run.probes.flatMap(probe => probe.result.configurations);
+  if (configurations.some(configuration => configuration.diagnostics.targetSaturated))
+    warnings.push("At least one sampler entropy target saturated at the retained support limit.");
+  if (configurations.some(configuration => Math.abs(configuration.diagnostics.samplerEntropyError) > 0.02))
+    warnings.push("Protocol-guard projection materially changed final sampler entropy in at least one probe.");
+  const sensitive = aggregates.filter(aggregate => aggregate.mappingSensitivity > 0.1);
+  if (sensitive.length)
+    warnings.push("Mapping sensitivity is high in at least one stage; pooled label rotations may be hiding unstable individual prompts.");
+  if (aggregates.some(aggregate => aggregate.openTv < 0.1 && aggregate.mappingSensitivity > 0.1))
+    warnings.push("A pooled score looks strong while per-mapping distributions remain unstable.");
+
+  if (distributionSupportMatches(run)) {
+    const retainedMismatch = run.probes.some(probe => {
+      const left = probe.result.configurations.find(configuration => configuration.id === "A")?.retainedRaw;
+      const right = probe.result.configurations.find(configuration => configuration.id === "B")?.retainedRaw;
+      return left && right && left.outcomes.some((outcome, index) =>
+        outcome.retained !== right.outcomes[index].retained || Math.abs(outcome.probability - right.outcomes[index].probability) > 1e-9);
+    });
+    if (retainedMismatch) warnings.push("Retained-raw A and B differ even though support settings match; inspect the exported probe data.");
+  }
+  return warnings;
+}
+
+function renderDistributionResults() {
+  const run = activeDistributionRun;
+  elements.distClear.disabled = distributionRunning || !run;
+  elements.distExportJson.disabled = !run?.probes.length;
+  elements.distExportCsv.disabled = !run?.probes.length;
+  elements.distSummaryBody.replaceChildren();
+  if (!run) {
+    elements.distResults.hidden = true;
+    elements.distWarnings.hidden = true;
+    elements.distWarnings.replaceChildren();
+    elements.distRunStatus.textContent = "Ready to measure.";
+    elements.distProgress.textContent = "";
+    elements.distStart.textContent = "Run balanced block";
+    drawDistributionCharts(null, []);
+    return;
+  }
+
+  elements.distStart.textContent = ["paused", "stopped"].includes(run.status) &&
+    run.nextMappingIndex < run.mappings.length ? "Resume saved run" : "Run another balanced block";
+  if (!distributionRunning) {
+    if (run.status === "complete") {
+      elements.distRunStatus.textContent = "Saved balanced run complete.";
+      elements.distProgress.textContent = `${run.probes.length} probes`;
+    } else if (run.status === "paused") {
+      elements.distRunStatus.textContent = "Saved run paused after browser reload.";
+      elements.distProgress.textContent = `${run.probes.length} / ${run.mappings.length} probes complete`;
+    } else if (run.status === "stopped") {
+      elements.distRunStatus.textContent = "Saved run stopped and resumable.";
+      elements.distProgress.textContent = `${run.probes.length} / ${run.mappings.length} probes complete`;
+    } else if (run.status === "error") {
+      elements.distRunStatus.textContent = "Saved run ended with an error.";
+      elements.distProgress.textContent = `${run.probes.length} / ${run.mappings.length} probes complete`;
+    }
+  }
+
+  const aggregates = distributionAggregates(run);
+  elements.distResults.hidden = !aggregates.length;
+  if (aggregates.length) {
+    for (const aggregate of aggregates) appendDistributionSummaryRow(aggregate);
+    const partial = run.probes.length < run.mappings.length ? "Partial" : "Complete";
+    elements.distResultCaption.textContent =
+      `${partial} semantic aggregate across ${run.probes.length}/${run.mappings.length} mappings · ${run.task.name}.`;
+    renderDistributionOutcomeTable(run, aggregates);
+    renderDistributionMappingTable(run);
+    renderDistributionMassBars(aggregates);
+    drawDistributionCharts(run, aggregates);
+  }
+
+  const warnings = distributionWarnings(run, aggregates);
+  elements.distWarnings.replaceChildren(...warnings.map(text => {
+    const warning = document.createElement("span");
+    warning.textContent = text;
+    return warning;
+  }));
+  elements.distWarnings.hidden = !warnings.length;
+}
+
+function exportDistributionJson() {
+  if (!activeDistributionRun?.probes.length) return;
+  downloadEvaluation(`logit-scope-distribution-${activeDistributionRun.id}.json`, "application/json",
+    JSON.stringify(activeDistributionRun, null, 2));
+}
+
+function exportDistributionCsv() {
+  const run = activeDistributionRun;
+  if (!run?.probes.length) return;
+  const aggregates = new Map(distributionAggregates(run).map(aggregate => [aggregate.descriptor.key, aggregate]));
+  const descriptors = distributionStageDescriptors(run);
+  const headings = [
+    "task_id", "task_kind", "run_id", "block", "rotation", "mapping_id", "stage", "configuration_id",
+    "configuration_name", "model_path", "requested_assistant_prefix", "assistant_prefix", "label_token_prefix",
+    "assistant_prefix_auto_selected", "auto_select_assistant_prefix", "formatted_prompt", "prompt_token_count",
+    "sample_count", "seed", "profile", "diversity", "candidate_cap", "minimum_relative_probability", "protect_control_tokens",
+    "outcome_id", "outcome_text", "label", "token_id", "target_probability", "probability", "projected_count",
+    "retained", "rank", "valid_mass", "invalid_mass", "open_tv", "conditional_tv", "open_js_distance",
+    "conditional_entropy_error", "missing_target_mass", "pairwise_order_accuracy", "support_size",
+    "sampler_target_entropy", "sampler_shaped_entropy", "target_saturated", "pooled_open_tv",
+    "pooled_conditional_tv", "mapping_sensitivity"
+  ];
+  const rows = [];
+  for (const probe of run.probes) {
+    for (const descriptor of descriptors) {
+      const stage = descriptor.stage(probe);
+      if (!stage) continue;
+      const configuration = descriptor.configurationId ?
+        probe.result.configurations.find(value => value.id === descriptor.configurationId) : null;
+      const aggregate = aggregates.get(descriptor.key);
+      for (const outcome of stage.outcomes) {
+        rows.push([
+          run.task.id, run.task.kind, run.id, probe.mapping.block, probe.mapping.rotation, probe.result.mappingId,
+          descriptor.key, descriptor.configurationId || "", configuration?.name || "", probe.result.modelPath,
+          probe.result.requestedAssistantPrefix ?? run.assistantPrefix, probe.result.assistantPrefix,
+          probe.result.labelTokenPrefix || "", probe.result.assistantPrefixAutoSelected, run.autoSelectAssistantPrefix,
+          probe.result.formattedPrompt,
+          probe.result.promptTokenCount, probe.result.sampleCount, run.seed, configuration?.settings.profile,
+          configuration?.settings.diversity,
+          configuration?.settings.candidateCap, configuration?.settings.minimumRelativeProbability,
+          configuration?.settings.protectControlTokens, outcome.id, outcome.text, outcome.label, outcome.tokenId,
+          outcome.targetProbability, outcome.probability, outcome.projectedCount, outcome.retained, outcome.rank,
+          stage.openMetrics.validMass, stage.openMetrics.invalidMass, stage.openMetrics.totalVariation,
+          stage.conditionalMetrics.valid ? stage.conditionalMetrics.totalVariation : null,
+          stage.openMetrics.jsDistanceNormalized, stage.conditionalMetrics.valid ?
+            stage.conditionalMetrics.conditionalEntropyError : null, stage.openMetrics.missingTargetMass,
+          stage.conditionalMetrics.valid ? stage.conditionalMetrics.pairwiseOrderAccuracy : null,
+          configuration?.diagnostics.supportSize, configuration?.diagnostics.samplerTargetEntropy,
+          configuration?.diagnostics.samplerShapedEntropy, configuration?.diagnostics.targetSaturated,
+          aggregate?.openTv, aggregate?.conditionalTv, aggregate?.mappingSensitivity
+        ]);
+      }
+    }
+  }
+  const csv = [headings, ...rows].map(row => row.map(csvCell).join(",")).join("\r\n");
+  downloadEvaluation(`logit-scope-distribution-${run.id}.csv`, "text/csv;charset=utf-8", csv);
+}
+
+function restoreDistributionRunControls(run, restoreConfigurations) {
+  elements.distTask.value = run.task.id;
+  elements.distBlocks.value = run.blocks;
+  elements.distDraws.value = run.sampleCount;
+  elements.distSeed.value = run.seed;
+  if (!restoreConfigurations) return;
+  elements.distPrefix.value = run.assistantPrefix;
+  elements.distAutoPrefix.checked = run.autoSelectAssistantPrefix !== false;
+  elements.distLockSupport.checked = run.supportLocked;
+  for (const side of ["A", "B"]) {
+    const configuration = run.configurations.find(value => value.id === side);
+    if (!configuration) continue;
+    distributionField(side, "Profile").value = configuration.settings.profile;
+    distributionField(side, "Diversity").value = Math.round(configuration.settings.diversity * 100);
+    distributionField(side, "Cap").value = String(configuration.settings.candidateCap);
+    distributionField(side, "Floor").value = String(configuration.settings.minimumRelativeProbability);
+    distributionField(side, "Guard").checked = configuration.settings.protectControlTokens;
+  }
+}
+
+function initializeDistributionLab() {
+  for (const task of distributionTasks) {
+    const option = document.createElement("option");
+    option.value = task.id;
+    option.textContent = `${task.kind === "control" ? "Controls" : "Implicit"} · ${task.name}`;
+    elements.distTask.append(option);
+    const mappings = createBalancedDistributionMappings(normalizedTaskOutcomes(task), 2, 1234);
+    verifyBalancedDistributionBlock(mappings, normalizedTaskOutcomes(task), 0);
+    verifyBalancedDistributionBlock(mappings, normalizedTaskOutcomes(task), 1);
+  }
+  window.logitScopeDistributionMappings = {
+    create: createBalancedDistributionMappings,
+    verifyBlock: verifyBalancedDistributionBlock
+  };
+  if (activeDistributionRun?.task?.id) {
+    const resumable = ["paused", "stopped"].includes(activeDistributionRun.status) &&
+      activeDistributionRun.nextMappingIndex < activeDistributionRun.mappings.length;
+    restoreDistributionRunControls(activeDistributionRun, resumable);
+  }
+  renderDistributionTask();
+  synchronizeDistributionSupport();
+  saveDistributionRun();
+  renderDistributionResults();
+}
+
 for (const element of [elements.profile, elements.seed, elements.protectControlTokens]) element.addEventListener("change", queueSettings);
 elements.diversity.addEventListener("input", queueSettings);
 elements.candidateCap.addEventListener("change", queueSettings);
@@ -973,11 +1902,27 @@ elements.evalExperiment.addEventListener("change", () => {
 elements.evalExportJson.addEventListener("click", exportEvaluationJson);
 elements.evalExportCsv.addEventListener("click", exportEvaluationCsv);
 elements.evalDelete.addEventListener("click", deleteActiveEvaluation);
-window.addEventListener("resize", drawPlot);
+elements.distTask.addEventListener("change", renderDistributionTask);
+for (const side of ["A", "B"])
+  distributionField(side, "Profile").addEventListener("change", updateDistributionConfigControls);
+for (const name of ["Cap", "Floor", "Guard"])
+  distributionField("A", name).addEventListener("change", synchronizeDistributionSupport);
+elements.distLockSupport.addEventListener("change", synchronizeDistributionSupport);
+elements.distStart.addEventListener("click", startDistributionRun);
+elements.distStop.addEventListener("click", stopDistributionRun);
+elements.distClear.addEventListener("click", clearDistributionRun);
+elements.distExportJson.addEventListener("click", exportDistributionJson);
+elements.distExportCsv.addEventListener("click", exportDistributionCsv);
+window.addEventListener("resize", () => {
+  drawPlot();
+  if (activeDistributionRun?.probes.length)
+    drawDistributionCharts(activeDistributionRun, distributionAggregates(activeDistributionRun));
+});
 
 renderEvaluationSelector();
 renderEvaluationSummary();
 showNextUnjudgedTrial();
+initializeDistributionLab();
 updateControlLabels();
 drawPlot();
 poll();
