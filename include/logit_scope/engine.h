@@ -185,7 +185,7 @@ class Engine
     void start();
     void stop();
     bool submit_message(std::string message);
-    std::uint64_t submit_evaluation(std::string prompt, const ShapeSettings& settings);
+    std::uint64_t submit_evaluation(std::string prompt, const ShapeSettings& settings, std::string assistant_prefix = {});
     std::uint64_t submit_distribution(DistributionProbeRequest request);
     void cancel_generation();
     void clear_conversation();

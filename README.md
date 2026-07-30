@@ -27,11 +27,11 @@ Profile, diversity, candidate-policy, and protocol-guard changes take effect on 
 
 The **Blind settings comparison** panel turns a settings impression into a repeatable paired experiment:
 
-1. Define configurations A and B. The supplied starting comparison holds the candidate policy constant and compares the raw bypass against the default Soliton personality.
-2. Add several prompts and choose repeats. Every pair uses the same prompt and seed in two isolated one-turn conversations; the normal chat and controls are restored after each response.
-3. Generate the pairs. Response placement is randomized, generation order is randomized, and configuration identities stay concealed while judging.
-4. Score both responses from 1–5 for task fit, coherence, and style/usefulness, then choose left, tie, or right. Settings and diagnostics reveal only after the judgment is saved.
-5. Read the aggregate preference score, win/tie/loss counts, mean rubric ratings, word counts, repeated-trigram rates, and two-sided exact sign-test result. Export the full experiment as JSON or CSV for outside analysis.
+1. Define configurations A and B using the same profile, diversity, candidate-policy, and protocol-guard controls as the main chat.
+2. Add several prompts and choose repeats.
+3. Generate the pairs. Every response uses an isolated one-turn conversation with the same prompt and seed; response placement, generation order, and settings stay concealed while judging.
+4. Score both responses from 1–5 for task fit, coherence, and style/usefulness, then choose left, tie, or right. Configuration identities reveal only after the judgment is saved.
+5. Read the aggregate preference score, win/tie/loss counts, mean rubric ratings, word counts, repeated-trigram rates, and two-sided exact sign-test result. Export the self-contained experiment as JSON or CSV.
 
 Blind pairwise comparison reduces expectation and position effects; position bias is a documented concern in LLM evaluation, including [MT-Bench and Chatbot Arena](https://arxiv.org/abs/2306.05685). Paired prompts and seeds reduce nuisance variation, while multiple task types test whether a setting generalizes beyond one appealing sample.
 
@@ -39,15 +39,17 @@ The lab produces better evidence, not an automatic definition of quality. A sing
 
 ## Distribution Lab
 
-The **Distribution Lab** measures whether sampler profiles allocate probability mass accurately on finite tasks with known answer distributions. Its default comparison holds candidate support fixed and evaluates entropy-matched **Temperature** and **Soliton** configurations from the same next-token logits.
+The **Distribution Lab** measures whether sampler profiles allocate probability mass accurately on finite tasks with known answer distributions. Its default comparison holds candidate support fixed and evaluates entropy-matched **Temperature** and **Soliton** configurations from the same next-token logits. An optional diagnostic separately tests direct semantic-probability inference followed by an external categorical sampler.
 
 Built-in tasks cover the sum and maximum of two fair dice, the number of heads in four fair tosses, the first-head position in three tosses, and an explicit-probability pipeline control. A run works as follows:
 
 1. Choose a task, sampler settings, balanced-block count, preferred assistant prefix, projected-draw count, and seed. Distribution Lab defaults Min-P to off so valid answer labels are not removed before profile shaping.
 2. For each mapping, the interface assigns every semantic outcome an opaque uppercase label and rotates both label assignments and display positions. One balanced block gives every outcome every label and every position exactly once.
-3. The engine formats the prompt, validates every label as exactly one distinct token in that precise tokenizer context, and automatically selects a compatible boundary when the preferred assistant prefix would retokenize a label. This can move trailing whitespace from the decoded context into each label token, which lets tokenizers use their natural leading-space label tokens without changing the labels shown in the experiment. The resolved context prefix and label-token prefix are recorded with the result. The selected prompt is then decoded once to read the complete next-token logits.
+3. The engine formats the prompt, validates every label as exactly one distinct token in that precise tokenizer context, and automatically selects a compatible boundary when the preferred assistant prefix would retokenize a label. Automatic mode prefers the model's natural leading-space label tokens and can remove a trailing `→` separator that would otherwise force low-probability bare-label tokens. The resolved context prefix and label-token prefix are recorded with the result. The selected prompt is then decoded once to read the complete next-token logits.
 4. Every requested configuration transforms an independent copy of those same logits through the normal candidate cap, Min-P, rank-profile, and protocol-guard implementation.
 5. Results are converted from label space back to semantic outcomes and aggregated as both pooled scores and mean per-mapping scores. Mapping sensitivity shows when balanced averaging hides unstable individual prompts.
+
+When **Semantic inference + external RNG** is enabled, the lab also sends one isolated prompt that lists the process and semantic outcome IDs but omits the scorer's target probabilities. It parses the model's returned decimal or fractional probabilities, normalizes them, and projects draws with a seeded external categorical sampler. The prompt and complete model response remain visible and are exported for audit. This path can correct semantic ordering because it is not a rank-preserving transform of the shared label logits; for that same reason, its results are labeled as a different architecture rather than an A/B sampler-profile victory.
 
 The lab reports three probability stages:
 
@@ -55,11 +57,27 @@ The lab reports three probability stages:
 - **Retained raw** is the normalized distribution after candidate-cap and Min-P support selection but before profile shaping.
 - **Shaped** is the final normalized distribution after the selected rank profile and protocol guard.
 
-Open-set metrics include probability assigned to every invalid token, while label-conditional metrics renormalize only the valid labels to isolate relative weighting from response-protocol failure. Total variation and normalized Jensen–Shannon distance are the primary distribution errors; valid/invalid mass, missing target mass, entropy error, pairwise order accuracy, top invalid tokens, and mapping sensitivity explain why a score changed.
+Open-set metrics include probability assigned to every invalid token, while label-conditional metrics renormalize only the valid labels to isolate relative weighting from response-protocol failure. Total variation and normalized Jensen–Shannon distance are the primary distribution errors; valid/invalid mass, missing target mass, entropy error, pairwise order accuracy, top invalid tokens, and mapping sensitivity explain why a score changed. Target, full raw, A shaped, B shaped, and semantic-inference distributions are drawn as separate full-width charts on one shared scale so their overall shapes remain legible.
 
-The **Projected draws** counts are deterministic categorical samples from the exact shaped probability vector. They make expected repeated behavior intuitive and verify the categorical sampler, but they are not repeated model decodes and are never the source of the score. Version 1 intentionally supports built-in finite tasks, one generated token, and context-validated one-token labels only. Automatic boundary selection tries the preferred prefix first and then a small set of explicit token boundaries; a tokenizer that cannot represent enough distinct labels in any supported context fails the probe clearly instead of producing misleading sequence probabilities. Automatic selection can be disabled in the advanced controls when an exact prompt protocol is required.
+The **Projected draws** counts are deterministic categorical samples from the exact shaped probability vector. They make expected repeated behavior intuitive and verify the categorical sampler, but they are not repeated model decodes and are never the source of the score. Version 1 intentionally supports built-in finite tasks, one generated token, and context-validated one-token labels only. Automatic boundary selection tries natural leading-space boundaries, the preferred prefix, and a small set of explicit separators; a tokenizer that cannot represent enough distinct labels in any supported context fails the probe clearly instead of producing misleading sequence probabilities. Automatic selection can be disabled in the advanced controls when an exact prompt protocol is required.
 
-Runs are saved separately from Blind Lab experiments in browser-local storage. A stopped or browser-interrupted run can resume from its next incomplete mapping. JSON export preserves every raw probe and its formatted prompt; long-form CSV repeats stage, mapping, semantic outcome, token, resolved boundary, exact probability, projected count, sampler diagnostics, and pooled metrics for analysis.
+Distribution runs and Blind Lab experiments are saved separately in browser-local storage. A stopped or browser-interrupted run can resume from its next incomplete mapping. JSON export preserves every raw probe, formatted prompt, and semantic-inference response; long-form CSV repeats stage, mapping, semantic outcome, token, resolved boundary, exact probability, projected count, sampler diagnostics, and pooled metrics for analysis.
+
+### Distribution research runner
+
+`tools/distribution_research.py` reproduces the built-in tasks and balanced browser mappings through a running Logit Scope API. It records exact probes, evaluates permutation pooling, and fits scalar, label/position, and target-free debiasing baselines with leave-one-task-out splits. It can also collect direct semantic vectors on held-out procedural tasks.
+
+```powershell
+python tools/distribution_research.py self-test
+python tools/distribution_research.py run --url http://127.0.0.1:8080 --blocks 2 --output baseline.json
+python tools/distribution_research.py infer --url http://127.0.0.1:8080 --input baseline.json --output with-inference.json
+python tools/distribution_research.py procedural --url http://127.0.0.1:8080 --procedural-count 20 --output held-out.json
+python tools/distribution_research.py analyze --input held-out.json --report-output held-out-report.json
+```
+
+For Qwen3-4B-Q4_K_M, one fixed-seed suite of 20 procedurally generated tasks produced valid direct probability vectors on 17/20 tasks with macro TV 0.190931. This is a reproducible local measurement, not a claim of unrestricted natural-language generalization.
+
+The runner labels any temperature fitted directly on the held-out target as **Oracle**. That score is a diagnostic lower bound, not a deployable result.
 
 ## Clone and build
 

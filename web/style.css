@@ -282,6 +282,7 @@ button:disabled { cursor: default; opacity: 0.42; }
   border-radius: 6px;
   font-size: 12px;
   line-height: 1.45;
+  white-space: pre-line;
 }
 .evaluation-results-heading > label { width: min(320px, 45%); }
 .evaluation-table-wrap { margin-top: 11px; overflow-x: auto; }
@@ -336,7 +337,7 @@ button:disabled { cursor: default; opacity: 0.42; }
 .distribution-configs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .distribution-config > .check-control { margin-top: 9px; }
 .distribution-runner { display: grid; gap: 10px; background: var(--panel-2); }
-.distribution-run-options { display: grid; grid-template-columns: 145px 200px 145px auto; gap: 10px; align-items: end; }
+.distribution-run-options { display: grid; grid-template-columns: 145px 200px 145px auto auto auto; gap: 10px; align-items: end; }
 .distribution-advanced {
   padding: 8px 10px;
   border: 1px solid #2c3640;
@@ -377,9 +378,10 @@ button:disabled { cursor: default; opacity: 0.42; }
 .distribution-summary-table tr.full-raw td:first-child { color: var(--raw); }
 .distribution-summary-table tr.config-a td:first-child { color: #ffd07a; }
 .distribution-summary-table tr.config-b td:first-child { color: #ff9b42; }
+.distribution-summary-table tr.inferred td:first-child { color: #6ee7b7; }
 .distribution-chart-heading { align-items: center; }
 .distribution-chart-heading small { color: var(--muted); font-size: 10px; }
-.distribution-chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.distribution-chart-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 .distribution-chart-card {
   min-width: 0;
   padding: 10px;
@@ -397,13 +399,16 @@ button:disabled { cursor: default; opacity: 0.42; }
 .distribution-chart-card.raw h3 { color: var(--raw); }
 .distribution-chart-card.config-a h3 { color: #ffd07a; }
 .distribution-chart-card.config-b h3 { color: var(--shaped); }
-.distribution-chart-card canvas { display: block; width: 100%; height: 240px; }
-.distribution-mass-bars { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.distribution-chart-card.inferred h3 { color: #6ee7b7; }
+.distribution-chart-card canvas { display: block; width: 100%; height: 280px; }
+.distribution-mass-bars { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .distribution-mass-row { display: grid; grid-template-columns: 110px minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: 10px; }
 .distribution-mass-track { display: flex; height: 8px; overflow: hidden; background: #5d3434; border-radius: 999px; }
 .distribution-mass-valid { background: #3f9f72; }
 .distribution-mappings > summary { color: var(--muted); cursor: pointer; font-size: 11px; }
 .distribution-mappings > .distribution-table-wrap { margin-top: 10px; }
+.distribution-inference-details > summary { color: #6ee7b7; cursor: pointer; font-size: 11px; }
+.distribution-inference-details > p { margin: 8px 0 0; color: var(--muted); font-size: 10px; line-height: 1.4; }
 .distribution-invalid-tokens {
   max-height: 180px;
   margin: 10px 0 0;

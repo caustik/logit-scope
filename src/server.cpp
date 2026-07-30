@@ -305,8 +305,9 @@ class Server::Impl
                          {
                              const auto input = json::parse(request.body);
                              const auto prompt = input.value("prompt", std::string{});
+                             const auto assistant_prefix = input.value("assistantPrefix", std::string{});
                              const auto settings = settings_from_json(input.value("settings", json::object()), engine_.shape_settings());
-                             const auto id = engine_.submit_evaluation(prompt, settings);
+                             const auto id = engine_.submit_evaluation(prompt, settings, assistant_prefix);
                              if (id == 0)
                              {
                                  send_json(response, {{"error", "The model is not ready for an evaluation response"}}, 409);

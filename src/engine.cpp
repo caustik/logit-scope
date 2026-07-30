@@ -157,15 +157,16 @@ class Engine::Impl
         return true;
     }
 
-    std::uint64_t submit_evaluation(std::string prompt, const ShapeSettings& settings)
+    std::uint64_t submit_evaluation(std::string prompt, const ShapeSettings& settings, std::string assistant_prefix)
     {
         prompt.erase(prompt.begin(), std::find_if(prompt.begin(), prompt.end(), [](unsigned char value) { return !std::isspace(value); }));
         while (!prompt.empty() && std::isspace(static_cast<unsigned char>(prompt.back()))) prompt.pop_back();
-        if (prompt.empty()) return 0;
+        if (prompt.empty() || assistant_prefix.size() > 512) return 0;
 
         EvaluationRequest request;
         request.id = next_evaluation_id_.fetch_add(1);
         request.prompt = std::move(prompt);
+        request.assistant_prefix = std::move(assistant_prefix);
         request.settings = settings;
         request.restoration_settings = shape_settings();
         {
@@ -374,6 +375,7 @@ class Engine::Impl
     {
         std::uint64_t id = 0;
         std::string prompt;
+        std::string assistant_prefix;
         ShapeSettings settings;
         ShapeSettings restoration_settings;
         SamplingSnapshot restoration_snapshot;
@@ -495,7 +497,7 @@ class Engine::Impl
         if (context_ != nullptr) llama_memory_clear(llama_get_memory(context_), true);
         set_shape_settings(request.settings);
 
-        process_message(request.prompt);
+        process_message(request.prompt, request.assistant_prefix);
         const auto generated_snapshot = snapshot();
 
         EvaluationResult result;
@@ -767,13 +769,21 @@ class Engine::Impl
                 return;
             candidates.push_back({std::move(assistant_prefix), std::move(label_token_prefix)});
         };
-        append_candidate(request.assistant_prefix);
-        if (!request.auto_select_assistant_prefix) return candidates;
+        if (!request.auto_select_assistant_prefix)
+        {
+            append_candidate(request.assistant_prefix);
+            return candidates;
+        }
 
         auto base = request.assistant_prefix;
         while (!base.empty() && std::isspace(static_cast<unsigned char>(base.back()))) base.pop_back();
         if (base.size() != request.assistant_prefix.size()) append_candidate(base, request.assistant_prefix.substr(base.size()));
         constexpr auto arrow = "\xe2\x86\x92";
+        if (base.size() >= std::char_traits<char>::length(arrow) &&
+            base.compare(base.size() - std::char_traits<char>::length(arrow), std::char_traits<char>::length(arrow), arrow) == 0)
+            append_candidate(base.substr(0, base.size() - std::char_traits<char>::length(arrow)), " ");
+        append_candidate(base, " ");
+        append_candidate(request.assistant_prefix);
         append_candidate(base + arrow);
         append_candidate(base + "\n");
         append_candidate(base + "[");
@@ -1076,7 +1086,7 @@ class Engine::Impl
         }
     }
 
-    void process_message(const std::string& message)
+    void process_message(const std::string& message, const std::string& assistant_prefix = {})
     {
         messages_.push_back({"user", message});
 
@@ -1087,6 +1097,7 @@ class Engine::Impl
             publish_status("Unable to apply the model chat template", false);
             return;
         }
+        formatted += assistant_prefix;
 
         const auto first_prompt = previous_formatted_length_ == 0;
         const auto prompt_start = std::min(previous_formatted_length_, formatted.size());
@@ -1212,7 +1223,7 @@ class Engine::Impl
                                     ? "Context limit reached - clear the conversation to continue"
                                     : "Ready - maximum response length reached";
 
-        messages_.push_back({"assistant", current_response_});
+        messages_.push_back({"assistant", assistant_prefix + current_response_});
         if (generation_failed)
         {
             llama_memory_clear(llama_get_memory(context_), true);
@@ -1671,9 +1682,9 @@ void Engine::stop() { impl_->stop(); }
 
 bool Engine::submit_message(std::string message) { return impl_->submit_message(std::move(message)); }
 
-std::uint64_t Engine::submit_evaluation(std::string prompt, const ShapeSettings& settings)
+std::uint64_t Engine::submit_evaluation(std::string prompt, const ShapeSettings& settings, std::string assistant_prefix)
 {
-    return impl_->submit_evaluation(std::move(prompt), settings);
+    return impl_->submit_evaluation(std::move(prompt), settings, std::move(assistant_prefix));
 }
 
 std::uint64_t Engine::submit_distribution(DistributionProbeRequest request) { return impl_->submit_distribution(std::move(request)); }

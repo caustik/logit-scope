@@ -115,7 +115,7 @@
       <div class="distribution-body">
         <div class="evaluation-intro">
           <p>Each mapping asks for one draw from a process with a known answer distribution. Opaque labels and display positions rotate in balanced blocks so semantic outcomes are not tied to label or list-order priors.</p>
-          <p>Exact next-token probabilities are the score. Projected draws are a deterministic visualization of expected sampling behavior, not repeated model generations.</p>
+          <p>Exact next-token probabilities score the shared-logits A/B experiment. An optional diagnostic asks the model to infer semantic probabilities once, then applies an ordinary external categorical sampler.</p>
         </div>
 
         <section class="distribution-task">
@@ -213,6 +213,9 @@
             <label class="check-control" title="Keep candidate cap, Min-P, and protocol guard matched">
               <input id="distLockSupport" type="checkbox" checked><span>Lock A/B support</span>
             </label>
+            <label class="check-control" title="Ask the model to infer semantic probabilities once, then use an external categorical sampler">
+              <input id="distInfer" type="checkbox" checked><span>Semantic inference + external RNG</span>
+            </label>
           </div>
           <details class="distribution-advanced">
             <summary>Advanced prompt protocol</summary>
@@ -262,7 +265,7 @@
 
           <div class="distribution-chart-heading">
             <h2>Semantic outcome probabilities</h2>
-            <small>Separate panels with a shared probability scale</small>
+            <small>One full-width chart per result, all using the same probability scale</small>
           </div>
           <div class="distribution-chart-grid">
             <article class="distribution-chart-card target">
@@ -281,17 +284,30 @@
               <h3 id="distChartTitleB">B shaped conditional</h3>
               <canvas id="distChartB" aria-label="Configuration B shaped conditional semantic-outcome probability bars"></canvas>
             </article>
+            <article class="distribution-chart-card inferred">
+              <h3>Inferred external sampler</h3>
+              <canvas id="distChartInferred" aria-label="Model-inferred externally sampled semantic-outcome probability bars"></canvas>
+            </article>
           </div>
           <div id="distMassBars" class="distribution-mass-bars"></div>
 
           <div class="distribution-table-wrap">
             <table>
               <thead>
-                <tr><th>Outcome</th><th>Target</th><th>Full raw</th><th>A shaped</th><th>B shaped</th><th>A projected</th><th>B projected</th></tr>
+                <tr>
+                  <th>Outcome</th><th>Target</th><th>Full raw</th><th>A shaped</th><th>B shaped</th><th>Inferred</th>
+                  <th>A projected total</th><th>B projected total</th><th>Inferred projected</th>
+                </tr>
               </thead>
               <tbody id="distOutcomeBody"></tbody>
             </table>
           </div>
+
+          <details id="distInferenceDetails" class="distribution-inference-details" hidden>
+            <summary id="distInferenceSummary">Semantic inference audit</summary>
+            <p>The target probabilities are not included in this prompt. The saved model response is parsed into a semantic vector and sampled by an ordinary seeded categorical RNG.</p>
+            <pre id="distInferenceResponse" class="distribution-invalid-tokens"></pre>
+          </details>
 
           <details class="distribution-mappings">
             <summary>Per-mapping labels, tokens, probabilities, and diagnostics</summary>

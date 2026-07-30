@@ -11,11 +11,11 @@ const elements = Object.fromEntries([
   "evalSummary", "evalExperiment", "evalSummaryBody", "evalExportJson", "evalExportCsv", "evalDelete",
   "distTask", "distTaskKind", "distTaskDescription", "distTargetBody", "distProfileA", "distDiversityA", "distCapA",
   "distFloorA", "distGuardA", "distProfileB", "distDiversityB", "distCapB", "distFloorB", "distGuardB", "distBlocks",
-  "distDraws", "distSeed", "distLockSupport", "distAutoPrefix", "distPrefix", "distStart", "distStop", "distClear",
-  "distRunStatus", "distProgress", "distWarnings", "distResults", "distResultCaption", "distExportJson", "distExportCsv",
-  "distSummaryBody",
-  "distChartTarget", "distChartRaw", "distChartA", "distChartB", "distChartTitleA", "distChartTitleB", "distMassBars",
-  "distOutcomeBody", "distMappingBody", "distInvalidTokens"
+  "distDraws", "distSeed", "distLockSupport", "distInfer", "distAutoPrefix", "distPrefix", "distStart",
+  "distStop", "distClear", "distRunStatus", "distProgress", "distWarnings", "distResults", "distResultCaption",
+  "distExportJson", "distExportCsv", "distSummaryBody", "distChartTarget", "distChartRaw", "distChartA", "distChartB",
+  "distChartInferred", "distChartTitleA", "distChartTitleB", "distMassBars", "distOutcomeBody",
+  "distInferenceDetails", "distInferenceSummary", "distInferenceResponse", "distMappingBody", "distInvalidTokens"
 ].map(id => [id, document.getElementById(id)]));
 
 let snapshot = null;
@@ -628,9 +628,11 @@ async function startEvaluation() {
   };
   evaluationStore.experiments.push(experiment);
   activeEvaluationId = experiment.id;
+  currentEvaluationTrialId = null;
   saveEvaluationStore();
   renderEvaluationSelector();
   renderEvaluationSummary();
+  showEvaluationTrial(null);
 
   evaluationCancelRequested = false;
   setEvaluationRunning(true);
@@ -670,6 +672,7 @@ async function startEvaluation() {
           judgment: null
         };
         experiment.trials.push(trial);
+        updateEvaluationNavigation();
         ++pairIndex;
         saveEvaluationStore();
         renderEvaluationSelector();
@@ -727,11 +730,23 @@ function revealEvaluationTrial(experiment, trial) {
   elements.evalRubric.hidden = true;
 }
 
+function updateEvaluationNavigation() {
+  const experiment = activeEvaluation();
+  const unjudgedCount = experiment?.trials.filter(trial => !trial.judgment).length || 0;
+  const otherUnjudgedCount = experiment?.trials.filter(
+    trial => !trial.judgment && trial.id !== currentEvaluationTrialId).length || 0;
+  elements.evalNext.disabled = !otherUnjudgedCount;
+  elements.evalNext.textContent = otherUnjudgedCount ?
+    `Next unjudged pair (${otherUnjudgedCount} available)` :
+    unjudgedCount ? "Current pair awaiting judgment" : "No unjudged pairs";
+}
+
 function showEvaluationTrial(trial) {
   const experiment = activeEvaluation();
   if (!experiment || !trial) {
     elements.evalJudge.hidden = true;
     currentEvaluationTrialId = null;
+    updateEvaluationNavigation();
     return;
   }
   currentEvaluationTrialId = trial.id;
@@ -741,7 +756,7 @@ function showEvaluationTrial(trial) {
   elements.evalPromptDisplay.textContent = trial.prompt;
   elements.evalLeftResponse.textContent = trial.leftIsA ? trial.responseA : trial.responseB;
   elements.evalRightResponse.textContent = trial.leftIsA ? trial.responseB : trial.responseA;
-  elements.evalNext.disabled = !experiment.trials.some(candidate => !candidate.judgment && candidate.id !== trial.id);
+  updateEvaluationNavigation();
 
   if (trial.judgment) {
     revealEvaluationTrial(experiment, trial);
@@ -808,7 +823,7 @@ function submitEvaluationJudgment() {
   revealEvaluationTrial(experiment, trial);
   renderEvaluationSelector();
   renderEvaluationSummary();
-  elements.evalNext.disabled = !experiment.trials.some(candidate => !candidate.judgment);
+  updateEvaluationNavigation();
 }
 
 function average(values) {
@@ -1007,6 +1022,7 @@ function loadDistributionRun() {
     if (run?.version === 1 && Array.isArray(run.mappings) && Array.isArray(run.probes)) {
       if (run.status === "running") run.status = "paused";
       if (run.autoSelectAssistantPrefix === undefined) run.autoSelectAssistantPrefix = true;
+      if (run.inferProbabilities === undefined) run.inferProbabilities = false;
       run.nextMappingIndex = Math.max(run.nextMappingIndex || 0, run.probes.length);
       return run;
     }
@@ -1180,6 +1196,111 @@ Simulate one independent occurrence of this process and return the label for its
 Return exactly one label.`;
 }
 
+function buildDistributionInferencePrompt(task) {
+  const outcomeLines = task.outcomes.map(outcome => `${outcome.id} = ${outcome.text}`).join("\n");
+  return `${task.description}
+
+The possible outcomes are:
+${outcomeLines}
+
+Infer the exact probability of every outcome. Return only one compact JSON object mapping each outcome ID to its probability as a decimal number. The probabilities must sum to 1. Do not sample an outcome.
+/no_think`;
+}
+
+function distributionRegexEscape(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseDistributionInferenceResponse(response, task) {
+  const objects = response.match(/\{[\s\S]*?\}/g) || [];
+  for (let objectIndex = objects.length - 1; objectIndex >= 0; --objectIndex) {
+    const object = objects[objectIndex];
+    const probabilities = [];
+    let valid = true;
+    for (const outcome of task.outcomes) {
+      const key = distributionRegexEscape(outcome.id);
+      const match = object.match(new RegExp(
+        `["']${key}["']\\s*:\\s*(\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?)(?:\\s*\\/\\s*(\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?))?`));
+      if (!match) {
+        valid = false;
+        break;
+      }
+      const numerator = Number(match[1]);
+      const denominator = match[2] === undefined ? 1 : Number(match[2]);
+      const probability = numerator / denominator;
+      if (!Number.isFinite(probability) || probability < 0 || !(denominator > 0)) {
+        valid = false;
+        break;
+      }
+      probabilities.push(probability);
+    }
+    if (!valid) continue;
+    const normalized = distributionNormalize(probabilities);
+    if (normalized) return normalized;
+  }
+  throw new Error("The semantic-inference response did not contain every requested outcome as a JSON probability");
+}
+
+function createDistributionProjectedCounts(probabilities, sampleCount, seed) {
+  const counts = probabilities.map(() => 0);
+  if (!sampleCount) return counts;
+  const cumulative = [];
+  let total = 0;
+  for (const probability of probabilities) {
+    total += probability;
+    cumulative.push(total);
+  }
+  cumulative[cumulative.length - 1] = 1;
+  const random = createSeededRandom(seed);
+  for (let sample = 0; sample < sampleCount; ++sample) {
+    const value = random();
+    const outcomeIndex = cumulative.findIndex(boundary => value < boundary);
+    ++counts[outcomeIndex < 0 ? counts.length - 1 : outcomeIndex];
+  }
+  return counts;
+}
+
+async function submitDistributionInference(run) {
+  const prompt = buildDistributionInferencePrompt(run.task);
+  const settings = {
+    profile: "temperature",
+    diversity: 0.7,
+    candidateCap: 64,
+    minimumRelativeProbability: 0,
+    seed: run.seed,
+    protectControlTokens: true
+  };
+  const result = await submitDistributionEvaluation(prompt, settings);
+  const probabilities = parseDistributionInferenceResponse(result.response, run.task);
+  return {
+    status: "complete",
+    generationStatus: result.status,
+    prompt,
+    settings,
+    response: result.response,
+    tokenCount: result.tokenCount,
+    probabilities,
+    projectedCounts: createDistributionProjectedCounts(probabilities, run.sampleCount, (run.seed ^ 0x51ed270b) >>> 0)
+  };
+}
+
+async function submitDistributionEvaluation(prompt, settings) {
+  const accepted = await request("/api/evaluation", {
+    method: "POST",
+    body: JSON.stringify({ prompt, settings })
+  });
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < deadline) {
+    if (distributionCancelRequested) throw new Error("Distribution run stopped");
+    const result = await request("/api/evaluation");
+    if (result.id === accepted.id && result.ready) {
+      return result;
+    }
+    await evaluationDelay(85);
+  }
+  throw new Error("Distribution evaluation timed out");
+}
+
 function createDistributionRun() {
   const task = selectedDistributionTask();
   const outcomes = normalizedTaskOutcomes(task);
@@ -1205,6 +1326,8 @@ function createDistributionRun() {
     assistantPrefix,
     autoSelectAssistantPrefix: elements.distAutoPrefix.checked,
     supportLocked: elements.distLockSupport.checked,
+    inferProbabilities: elements.distInfer.checked,
+    inference: null,
     configurations: [
       { id: "A", name: profileDisplayName(settingsA.profile), settings: settingsA },
       { id: "B", name: profileDisplayName(settingsB.profile), settings: settingsB }
@@ -1220,7 +1343,7 @@ function setDistributionRunning(running) {
   const setupControls = [
     "distTask", "distProfileA", "distDiversityA", "distCapA", "distFloorA", "distGuardA", "distProfileB",
     "distDiversityB", "distCapB", "distFloorB", "distGuardB", "distBlocks", "distDraws", "distSeed",
-    "distLockSupport", "distAutoPrefix", "distPrefix"
+    "distLockSupport", "distInfer", "distAutoPrefix", "distPrefix"
   ];
   const primaryControls = [
     "profile", "diversity", "candidateCap", "minimumRelativeProbability", "seed", "protectControlTokens", "message",
@@ -1292,6 +1415,22 @@ async function startDistributionRun() {
   elements.error.textContent = "";
 
   try {
+    if (activeDistributionRun.inferProbabilities && !activeDistributionRun.inference) {
+      elements.distRunStatus.textContent = "Inferring semantic probabilities for the external sampler…";
+      elements.distProgress.textContent = "One isolated model response";
+      try {
+        activeDistributionRun.inference = await submitDistributionInference(activeDistributionRun);
+      } catch (error) {
+        if (distributionCancelRequested) throw error;
+        activeDistributionRun.inference = {
+          status: "error",
+          prompt: buildDistributionInferencePrompt(activeDistributionRun.task),
+          error: error.message
+        };
+      }
+      saveDistributionRun();
+      renderDistributionResults();
+    }
     while (activeDistributionRun.nextMappingIndex < activeDistributionRun.mappings.length) {
       if (distributionCancelRequested) throw new Error("Distribution run stopped");
       const mappingIndex = activeDistributionRun.nextMappingIndex;
@@ -1468,8 +1607,46 @@ function aggregateDistributionStage(run, descriptor) {
   };
 }
 
+function aggregateInferredDistribution(run) {
+  const probabilities = run.inference?.status === "complete" ?
+    distributionNormalize(run.inference.probabilities) : null;
+  if (!probabilities || probabilities.length !== run.task.outcomes.length) return null;
+  const target = run.task.outcomes.map(outcome => outcome.targetProbability);
+  const divergence = distributionJensenShannon(probabilities, target);
+  return {
+    descriptor: {
+      key: "inferredExternal",
+      label: "Inferred semantic + external RNG",
+      className: "inferred"
+    },
+    stages: [],
+    pooled: probabilities,
+    conditional: probabilities,
+    projected: run.inference.projectedCounts || probabilities.map(() => 0),
+    validMass: 1,
+    invalidMass: 0,
+    openTv: distributionTotalVariation(probabilities, target),
+    conditionalTv: distributionTotalVariation(probabilities, target),
+    openJsd: divergence,
+    openJsDistance: Math.sqrt((divergence || 0) / Math.log(2)),
+    orderAccuracy: distributionPairwiseOrderAccuracy(probabilities, target),
+    entropyError: distributionEntropy(probabilities) - distributionEntropy(target),
+    missingTargetMass: 0,
+    meanMappingOpenTv: null,
+    standardDeviationOpenTv: null,
+    meanMappingConditionalTv: null,
+    standardDeviationConditionalTv: null,
+    mappingSensitivityDivergence: 0,
+    mappingSensitivity: 0
+  };
+}
+
 function distributionAggregates(run) {
-  return distributionStageDescriptors(run).map(descriptor => aggregateDistributionStage(run, descriptor)).filter(Boolean);
+  const aggregates = distributionStageDescriptors(run)
+    .map(descriptor => aggregateDistributionStage(run, descriptor)).filter(Boolean);
+  const inferred = aggregateInferredDistribution(run);
+  if (inferred) aggregates.push(inferred);
+  return aggregates;
 }
 
 function formatDistributionMetric(value, digits = 4) {
@@ -1577,18 +1754,24 @@ function drawDistributionCharts(run, aggregates) {
     { canvas: elements.distChartTarget, values: target, color: "#b779ff" },
     { canvas: elements.distChartRaw, values: byKey.get("fullRaw")?.conditional || [], color: "#43d0c1" },
     { canvas: elements.distChartA, values: byKey.get("shapedA")?.conditional || [], color: "#ffd07a" },
-    { canvas: elements.distChartB, values: byKey.get("shapedB")?.conditional || [], color: "#ff9b42" }
+    { canvas: elements.distChartB, values: byKey.get("shapedB")?.conditional || [], color: "#ff9b42" },
+    {
+      canvas: elements.distChartInferred,
+      values: byKey.get("inferredExternal")?.conditional || [],
+      color: "#6ee7b7",
+      emptyMessage: run?.inferProbabilities ? "Semantic inference unavailable" : "Semantic inference disabled for this run"
+    }
   ];
   const rawMaximum = Math.max(0.05, ...charts.flatMap(chart => chart.values));
   const maximum = Math.ceil(rawMaximum * 20) / 20;
   for (const chart of charts)
     drawDistributionSeriesChart(chart.canvas, run, chart.values, chart.color, maximum,
-                                "No valid label mass after support filtering");
+                                chart.emptyMessage || "No valid label mass after support filtering");
 }
 
 function renderDistributionMassBars(aggregates) {
   elements.distMassBars.replaceChildren();
-  for (const key of ["fullRaw", "shapedA", "shapedB"]) {
+  for (const key of ["fullRaw", "shapedA", "shapedB", "inferredExternal"]) {
     const aggregate = aggregates.find(value => value.descriptor.key === key);
     if (!aggregate) continue;
     const row = document.createElement("div");
@@ -1619,8 +1802,10 @@ function renderDistributionOutcomeTable(run, aggregates) {
     appendEvaluationCell(row, percentage(byKey.get("fullRaw")?.pooled[index]));
     appendEvaluationCell(row, percentage(byKey.get("shapedA")?.pooled[index]));
     appendEvaluationCell(row, percentage(byKey.get("shapedB")?.pooled[index]));
+    appendEvaluationCell(row, percentage(byKey.get("inferredExternal")?.pooled[index]));
     appendEvaluationCell(row, (byKey.get("shapedA")?.projected[index] || 0).toLocaleString());
     appendEvaluationCell(row, (byKey.get("shapedB")?.projected[index] || 0).toLocaleString());
+    appendEvaluationCell(row, (byKey.get("inferredExternal")?.projected[index] || 0).toLocaleString());
     elements.distOutcomeBody.append(row);
   }
 }
@@ -1666,6 +1851,8 @@ function distributionSupportMatches(run) {
 function distributionWarnings(run, aggregates) {
   const warnings = [];
   if (run.error) warnings.push(run.error);
+  if (run.inference?.status === "error")
+    warnings.push(`Semantic inference failed; the shared-logits probes continued: ${run.inference.error}`);
   if (run.probes.length < run.mappings.length)
     warnings.push(`Partial aggregate: ${run.probes.length} of ${run.mappings.length} balanced mappings are complete.`);
   if (!distributionSupportMatches(run))
@@ -1715,6 +1902,8 @@ function renderDistributionResults() {
   elements.distExportJson.disabled = !run?.probes.length;
   elements.distExportCsv.disabled = !run?.probes.length;
   elements.distSummaryBody.replaceChildren();
+  elements.distInferenceDetails.hidden = true;
+  elements.distInferenceResponse.textContent = "";
   if (!run) {
     elements.distResults.hidden = true;
     elements.distWarnings.hidden = true;
@@ -1756,7 +1945,14 @@ function renderDistributionResults() {
     renderDistributionMassBars(aggregates);
     drawDistributionCharts(run, aggregates);
   }
-
+  if (run.inference) {
+    elements.distInferenceDetails.hidden = false;
+    elements.distInferenceSummary.textContent = run.inference.status === "complete" ?
+      `Semantic inference audit · ${run.inference.tokenCount} generated tokens` : "Semantic inference audit · failed";
+    elements.distInferenceResponse.textContent = run.inference.status === "complete" ?
+      `Prompt (target probabilities omitted)\n\n${run.inference.prompt}\n\nModel response\n\n${run.inference.response}` :
+      `${run.inference.error}\n\nPrompt (target probabilities omitted)\n\n${run.inference.prompt}`;
+  }
   const warnings = distributionWarnings(run, aggregates);
   elements.distWarnings.replaceChildren(...warnings.map(text => {
     const warning = document.createElement("span");
@@ -1820,6 +2016,24 @@ function exportDistributionCsv() {
       }
     }
   }
+  const inferred = aggregates.get("inferredExternal");
+  if (inferred) {
+    const targetEntropy = distributionEntropy(run.task.outcomes.map(outcome => outcome.targetProbability));
+    const inferredEntropy = distributionEntropy(inferred.conditional);
+    const modelPath = run.probes[0]?.result.modelPath || "";
+    for (let index = 0; index < run.task.outcomes.length; ++index) {
+      const outcome = run.task.outcomes[index];
+      rows.push([
+        run.task.id, run.task.kind, run.id, "", "", "semantic-inference", "inferredExternal", "semantic-inference",
+        "Inferred semantic + external RNG", modelPath, "", "", "", false, "", run.inference.prompt,
+        run.inference.tokenCount, run.sampleCount, run.seed, "external-categorical", "", run.task.outcomes.length, 0,
+        true, outcome.id, outcome.text, "", "", outcome.targetProbability, inferred.pooled[index],
+        inferred.projected[index], true, "", 1, 0, inferred.openTv, inferred.conditionalTv, inferred.openJsDistance,
+        inferred.entropyError, 0, inferred.orderAccuracy, run.task.outcomes.length, targetEntropy, inferredEntropy, false,
+        inferred.openTv, inferred.conditionalTv, 0
+      ]);
+    }
+  }
   const csv = [headings, ...rows].map(row => row.map(csvCell).join(",")).join("\r\n");
   downloadEvaluation(`logit-scope-distribution-${run.id}.csv`, "text/csv;charset=utf-8", csv);
 }
@@ -1833,6 +2047,7 @@ function restoreDistributionRunControls(run, restoreConfigurations) {
   elements.distPrefix.value = run.assistantPrefix;
   elements.distAutoPrefix.checked = run.autoSelectAssistantPrefix !== false;
   elements.distLockSupport.checked = run.supportLocked;
+  elements.distInfer.checked = run.inferProbabilities === true;
   for (const side of ["A", "B"]) {
     const configuration = run.configurations.find(value => value.id === side);
     if (!configuration) continue;
@@ -1854,9 +2069,19 @@ function initializeDistributionLab() {
     verifyBalancedDistributionBlock(mappings, normalizedTaskOutcomes(task), 0);
     verifyBalancedDistributionBlock(mappings, normalizedTaskOutcomes(task), 1);
   }
+  const maximumTask = normalizedTaskOutcomes(distributionTasks.find(task => task.id === "two-dice-maximum"));
+  const fractionalInference = parseDistributionInferenceResponse(
+    '{"maximum-1":1/36,"maximum-2":3/36,"maximum-3":5/36,"maximum-4":7/36,"maximum-5":9/36,"maximum-6":11/36}',
+    { outcomes: maximumTask });
+  if (distributionTotalVariation(fractionalInference, maximumTask.map(outcome => outcome.targetProbability)) > 1e-12)
+    throw new Error("Distribution semantic-inference parser self-test failed");
   window.logitScopeDistributionMappings = {
     create: createBalancedDistributionMappings,
     verifyBlock: verifyBalancedDistributionBlock
+  };
+  window.logitScopeDistributionInference = {
+    buildPrompt: buildDistributionInferencePrompt,
+    parseResponse: parseDistributionInferenceResponse
   };
   if (activeDistributionRun?.task?.id) {
     const resumable = ["paused", "stopped"].includes(activeDistributionRun.status) &&
@@ -1883,9 +2108,8 @@ elements.message.addEventListener("keydown", event => {
     sendMessage();
   }
 });
-for (const side of ["A", "B"]) {
+for (const side of ["A", "B"])
   evaluationField(side, "Profile").addEventListener("change", () => updateEvaluationConfigControls(side));
-}
 elements.evalUseCurrentA.addEventListener("click", () => useCurrentControlsForEvaluation("A"));
 elements.evalUseCurrentB.addEventListener("click", () => useCurrentControlsForEvaluation("B"));
 elements.evalStart.addEventListener("click", startEvaluation);
@@ -1925,4 +2149,5 @@ showNextUnjudgedTrial();
 initializeDistributionLab();
 updateControlLabels();
 drawPlot();
+document.documentElement.dataset.logitScopeReady = "true";
 poll();
