@@ -228,6 +228,32 @@ json snapshot_to_json(const SamplingSnapshot& snapshot, const SamplingSnapshot& 
     return result;
 }
 
+json landscape_to_json(const LogitLandscape& landscape)
+{
+    json candidates = json::array();
+    for (const auto& candidate : landscape.candidates)
+    {
+        candidates.push_back({
+            {"tokenId", candidate.token_id},
+            {"text", candidate.text},
+            {"rank", candidate.rank},
+            {"relativeLogit", candidate.relative_logit},
+            {"protectedToken", candidate.protected_token},
+        });
+    }
+
+    return {
+        {"available", landscape.available},
+        {"samplingStep", landscape.sampling_step},
+        {"selectedTokenId", landscape.selected_token_id},
+        {"selectedToken", landscape.selected_token},
+        {"samplingSettings", settings_to_json(landscape.sampling_settings)},
+        {"finiteCandidateCount", landscape.finite_candidate_count},
+        {"capturedProbabilityMass", landscape.captured_probability_mass},
+        {"candidates", std::move(candidates)},
+    };
+}
+
 void send_json(httplib::Response& response, const json& value, int status = 200)
 {
     response.status = status;
@@ -257,6 +283,9 @@ class Server::Impl
                         const auto settings = engine_.shape_settings();
                         send_json(response, snapshot_to_json(engine_.snapshot(), engine_.preview_snapshot(settings), settings));
                     });
+
+        server_.Get("/api/landscape", [this](const httplib::Request&, httplib::Response& response)
+                    { send_json(response, landscape_to_json(engine_.logit_landscape())); });
 
         server_.Post("/api/message",
                      [this](const httplib::Request& request, httplib::Response& response)

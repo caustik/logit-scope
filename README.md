@@ -23,6 +23,14 @@ Profile, diversity, candidate-policy, and protocol-guard changes take effect on 
 
 ![Exploring effective alternatives around the default Soliton personality](docs/images/logit-scope-demo.gif)
 
+## Sampling Geometry Lab
+
+The open **Sampling Geometry Lab** makes the sampling pipeline inspectable before you judge response quality. Start from one of four synthetic logit landscapes, or replay the most uncertain ordinary token decision from the last completed response. Candidate cap, Min-P, and an optional teaching-only Top-P stage define the shared support. A fixed categorical draw then passes through every profile so changes in support, shape, and selection are not confused with different random numbers.
+
+The retained-raw, temperature, exponential, soliton, power, and half-normal distributions appear as separate charts on one probability scale. Each chart shows effective alternatives, the selected rank and token, its probability, and the draw interval that selected it. The landscape chart also marks the largest local logit gaps, making cliffs and shelves visible rather than hiding discarded candidates through immediate renormalization.
+
+Live replay is a counterfactual view, not a reproduction of the engine's exact historical RNG state. It captures up to the original candidate cap, reports how much full-vocabulary probability mass that retained window contained, and places the shared draw inside the interval of the token the model actually selected. Changing the teaching-only Top-P control does not alter normal chat sampling.
+
 ## Blind evaluation lab
 
 The **Blind settings comparison** panel turns a settings impression into a repeatable paired experiment:

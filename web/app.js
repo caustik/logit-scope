@@ -2,6 +2,13 @@ const elements = Object.fromEntries([
   "connection", "profile", "diversity", "diversityValue", "candidateCap", "minimumRelativeProbability", "seed",
   "protectControlTokens", "plot", "scopeCaption", "shapedLegend", "poolMass",
   "jsShift", "effectiveChoices", "peak", "selectedTokenLabel", "selectedToken", "transcript", "message", "clear", "stop",
+  "workbenchSource", "workbenchDiversity", "workbenchDiversityValue", "workbenchCap", "workbenchCapValue",
+  "workbenchMinP", "workbenchMinPValue", "workbenchTopP", "workbenchTopPValue", "workbenchDraw",
+  "workbenchDrawValue", "workbenchScale", "workbenchSourceNote", "workbenchLandscape",
+  "workbenchLandscapeCaption", "workbenchSupportCaption", "workbenchProfiles", "workbenchRaw",
+  "workbenchRawCaption", "workbenchTemperature", "workbenchTemperatureCaption", "workbenchExponential",
+  "workbenchExponentialCaption", "workbenchSoliton", "workbenchSolitonCaption", "workbenchPower",
+  "workbenchPowerCaption", "workbenchHalfNormal", "workbenchHalfNormalCaption",
   "send", "status", "error", "evalNameA", "evalProfileA", "evalDiversityA", "evalCapA", "evalFloorA", "evalGuardA",
   "evalUseCurrentA", "evalNameB", "evalProfileB", "evalDiversityB", "evalCapB", "evalFloorB", "evalGuardB",
   "evalUseCurrentB", "evalPrompts", "evalRepeats", "evalSeedStart", "evalStart", "evalCancel", "evalRunStatus",
@@ -25,6 +32,8 @@ let settingTimer = 0;
 let pendingSettings = null;
 let settingsRequestInFlight = false;
 let connected = false;
+let liveLogitLandscape = null;
+let requestedLandscapeKey = null;
 let staleSamplingStep = null;
 let displayedSamplingView = null;
 let evaluationDefaultsInitialized = false;
@@ -49,6 +58,493 @@ async function request(path, options = {}) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || `${response.status} ${response.statusText}`);
   return body;
+}
+
+const workbenchProfileDescriptors = [
+  { id: "none", canvas: "workbenchRaw", caption: "workbenchRawCaption", color: "#43d0c1" },
+  { id: "temperature", canvas: "workbenchTemperature", caption: "workbenchTemperatureCaption", color: "#ffd07a" },
+  { id: "exponential", canvas: "workbenchExponential", caption: "workbenchExponentialCaption", color: "#7dd3fc" },
+  { id: "soliton", canvas: "workbenchSoliton", caption: "workbenchSolitonCaption", color: "#ff9b42" },
+  { id: "power", canvas: "workbenchPower", caption: "workbenchPowerCaption", color: "#c4b5fd" },
+  { id: "half-normal", canvas: "workbenchHalfNormal", caption: "workbenchHalfNormalCaption", color: "#6ee7b7" }
+];
+
+const syntheticLandscapeNotes = {
+  "broad-shoulder": "A broad group of plausible leaders followed by a visible tail. Useful for seeing where equal-entropy profiles redistribute probability inside the support.",
+  "confident-cliff": "A few confident candidates separated from the tail by a sharp logit cliff. Truncation rules usually agree here; aggressive loosening can bridge the cliff.",
+  "long-tail": "No clean support boundary: probability decays gradually across many ranks. Fixed caps and cumulative-mass filters become especially consequential.",
+  "two-shelves": "Two local plateaus separated by a moderate gap. Useful for seeing whether a rank profile preserves or erodes a second semantic cluster."
+};
+
+function syntheticLogitLandscape(kind) {
+  const candidates = [];
+  for (let rank = 0; rank < 96; ++rank) {
+    let relativeLogit = 0;
+    if (kind === "confident-cliff") {
+      if (rank < 4) relativeLogit = -0.16 * rank - 0.035 * rank * rank;
+      else relativeLogit = -2.7 - 0.075 * (rank - 4) - 0.18 * Math.log1p(rank - 4);
+    } else if (kind === "long-tail") {
+      relativeLogit = -0.72 * Math.log1p(rank) - 0.006 * rank;
+    } else if (kind === "two-shelves") {
+      if (rank < 5) relativeLogit = -0.13 * rank;
+      else if (rank < 20) relativeLogit = -1.15 - 0.032 * (rank - 5);
+      else relativeLogit = -3.05 - 0.055 * (rank - 20);
+    } else {
+      if (rank < 12) relativeLogit = -0.075 * rank - 0.012 * rank * rank;
+      else relativeLogit = -2.05 - 0.085 * (rank - 12) - 0.12 * Math.log1p(rank - 12);
+    }
+    candidates.push({
+      tokenId: rank,
+      text: `rank ${rank + 1}`,
+      rank,
+      relativeLogit,
+      protectedToken: false
+    });
+  }
+  return {
+    available: true,
+    synthetic: true,
+    samplingStep: 0,
+    selectedTokenId: -1,
+    selectedToken: "",
+    samplingSettings: null,
+    finiteCandidateCount: candidates.length,
+    capturedProbabilityMass: 1,
+    candidates
+  };
+}
+
+function activeWorkbenchLandscape() {
+  return elements.workbenchSource.value === "live" && liveLogitLandscape ?
+    liveLogitLandscape : syntheticLogitLandscape(elements.workbenchSource.value);
+}
+
+function workbenchSoftmax(logits) {
+  if (!logits.length) return [];
+  const maximum = Math.max(...logits.filter(Number.isFinite));
+  const weights = logits.map(logit => Number.isFinite(logit) ? Math.exp(logit - maximum) : 0);
+  const total = weights.reduce((sum, value) => sum + value, 0);
+  return total > 0 ? weights.map(value => value / total) : weights.map(() => 0);
+}
+
+function workbenchEntropy(probabilities) {
+  return probabilities.reduce((entropy, probability) =>
+    probability > 0 ? entropy - probability * Math.log(probability) : entropy, 0);
+}
+
+function workbenchRankPenalty(profile, rank) {
+  if (profile === "exponential") return rank;
+  if (profile === "soliton") return 2 * (rank + Math.log1p(Math.exp(-2 * rank)) - Math.log(2));
+  if (profile === "power") return Math.log(rank + 1);
+  if (profile === "half-normal") return rank * rank;
+  return 0;
+}
+
+function workbenchShapedGap(profile, rawGap, profileGap, strength, loosen) {
+  if (profile === "temperature") {
+    const exponent = Math.min(64, strength);
+    return rawGap * Math.exp(loosen ? -exponent : exponent);
+  }
+  if (!loosen) return rawGap + strength * profileGap;
+  if (rawGap <= 0) return 0;
+  return rawGap * Math.exp(-Math.min(64, strength * profileGap / rawGap));
+}
+
+function workbenchEntropyAtStrength(logits, profile, strength, loosen) {
+  if (!logits.length) return 0;
+  let total = 0;
+  let weightedLogitTotal = 0;
+  const maximumLogit = logits[0];
+  let shapedLogit = maximumLogit;
+  for (let rank = 0; rank < logits.length; ++rank) {
+    if (rank > 0) {
+      const rawGap = Math.max(0, logits[rank - 1] - logits[rank]);
+      const profileGap = workbenchRankPenalty(profile, rank) - workbenchRankPenalty(profile, rank - 1);
+      shapedLogit -= workbenchShapedGap(profile, rawGap, profileGap, strength, loosen);
+    }
+    const normalizedLogit = shapedLogit - maximumLogit;
+    const weight = Math.exp(normalizedLogit);
+    total += weight;
+    if (weight > 0) weightedLogitTotal += weight * normalizedLogit;
+  }
+  return Math.log(Math.max(total, Number.MIN_VALUE)) - weightedLogitTotal / Math.max(total, Number.MIN_VALUE);
+}
+
+function workbenchShapeLogits(logits, profile, diversity, protectedRanks) {
+  const shaped = [...logits];
+  const clampedDiversity = Math.max(0, Math.min(2, diversity));
+  if (shaped.length >= 2 && profile !== "none" && clampedDiversity !== 1) {
+    if (clampedDiversity <= 0) {
+      shaped.fill(-Infinity, 1);
+    } else {
+      const rawEntropy = workbenchEntropy(workbenchSoftmax(shaped));
+      const maximumEntropy = Math.log(shaped.length);
+      const loosen = clampedDiversity > 1;
+      const rawEffectiveChoices = Math.exp(rawEntropy);
+      const targetEffectiveChoices =
+        Math.min(shaped.length, 1 + clampedDiversity * Math.max(0, rawEffectiveChoices - 1));
+      const targetEntropy = Math.log(targetEffectiveChoices);
+      if (targetEntropy >= maximumEntropy - 1e-12) {
+        shaped.fill(shaped[0], 1);
+      } else {
+        let lower = 0;
+        let upper = 1;
+        for (let iteration = 0; iteration < 32 &&
+          (loosen ? workbenchEntropyAtStrength(logits, profile, upper, true) < targetEntropy :
+            workbenchEntropyAtStrength(logits, profile, upper, false) > targetEntropy); ++iteration) {
+          upper *= 2;
+        }
+        for (let iteration = 0; iteration < 32; ++iteration) {
+          const middle = (lower + upper) * 0.5;
+          const entropy = workbenchEntropyAtStrength(logits, profile, middle, loosen);
+          if (loosen ? entropy < targetEntropy : entropy > targetEntropy) lower = middle;
+          else upper = middle;
+        }
+        const strength = (lower + upper) * 0.5;
+        let shapedLogit = logits[0];
+        for (let rank = 1; rank < logits.length; ++rank) {
+          const rawGap = Math.max(0, logits[rank - 1] - logits[rank]);
+          const profileGap = workbenchRankPenalty(profile, rank) - workbenchRankPenalty(profile, rank - 1);
+          shapedLogit -= workbenchShapedGap(profile, rawGap, profileGap, strength, loosen);
+          shaped[rank] = shapedLogit;
+        }
+      }
+    }
+  }
+
+  if (protectedRanks.some(Boolean)) {
+    protectedRanks.forEach((protectedToken, rank) => {
+      if (protectedToken) shaped[rank] = logits[rank];
+    });
+    let segmentBegin = 0;
+    let upperBound = Infinity;
+    while (segmentBegin < shaped.length) {
+      let nextProtected = segmentBegin;
+      while (nextProtected < shaped.length && !protectedRanks[nextProtected]) ++nextProtected;
+      const lowerBound = nextProtected < shaped.length ? logits[nextProtected] : -Infinity;
+      for (let rank = segmentBegin; rank < nextProtected; ++rank) {
+        shaped[rank] = Math.max(lowerBound, Math.min(upperBound, shaped[rank]));
+      }
+      if (nextProtected === shaped.length) break;
+      upperBound = logits[nextProtected];
+      segmentBegin = nextProtected + 1;
+    }
+  }
+  return shaped;
+}
+
+function workbenchSupport(landscape) {
+  const requestedCap = Number(elements.workbenchCap.value);
+  const cap = Math.max(2, Math.min(requestedCap, landscape.candidates.length));
+  const minP = Number(elements.workbenchMinP.value) / 100;
+  const topP = Number(elements.workbenchTopP.value) / 100;
+  const capped = landscape.candidates.slice(0, cap).map(candidate => ({ ...candidate }));
+  const minimumLogit = capped[0].relativeLogit + (minP > 0 ? Math.log(minP) : -Infinity);
+  let retained = capped.filter(candidate => candidate.relativeLogit >= minimumLogit || candidate.protectedToken);
+
+  if (topP < 1 && retained.length > 1) {
+    const probabilities = workbenchSoftmax(retained.map(candidate => candidate.relativeLogit));
+    let cumulative = 0;
+    let retainedCount = 0;
+    for (const probability of probabilities) {
+      cumulative += probability;
+      ++retainedCount;
+      if (cumulative >= topP) break;
+    }
+    retained = retained.filter((candidate, index) => index < retainedCount || candidate.protectedToken);
+  }
+
+  return { cap, minP, topP, capped, retained };
+}
+
+function workbenchSelect(probabilities, draw) {
+  let cumulative = 0;
+  for (let index = 0; index < probabilities.length; ++index) {
+    const start = cumulative;
+    cumulative += probabilities[index];
+    if (draw < cumulative || index === probabilities.length - 1)
+      return { index, start, end: cumulative };
+  }
+  return { index: 0, start: 0, end: probabilities[0] || 1 };
+}
+
+function workbenchProfileResults(support, diversity, draw) {
+  const logits = support.retained.map(candidate => candidate.relativeLogit);
+  const protectedRanks = support.retained.map(candidate => candidate.protectedToken);
+  return workbenchProfileDescriptors.map(descriptor => {
+    const shapedLogits = workbenchShapeLogits(logits, descriptor.id, diversity, protectedRanks);
+    const probabilities = workbenchSoftmax(shapedLogits);
+    const selection = workbenchSelect(probabilities, draw);
+    return {
+      ...descriptor,
+      logits: shapedLogits,
+      probabilities,
+      entropy: workbenchEntropy(probabilities),
+      selection,
+      selectedCandidate: support.retained[selection.index]
+    };
+  });
+}
+
+function workbenchCanvasContext(canvas) {
+  const rectangle = canvas.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(rectangle.width * ratio));
+  const height = Math.max(1, Math.round(rectangle.height * ratio));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  const context = canvas.getContext("2d");
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, rectangle.width, rectangle.height);
+  return { context, width: rectangle.width, height: rectangle.height };
+}
+
+function drawWorkbenchLandscape(landscape, support) {
+  const { context, width, height } = workbenchCanvasContext(elements.workbenchLandscape);
+  const margin = { left: 48, right: 14, top: 14, bottom: 26 };
+  const plotWidth = Math.max(1, width - margin.left - margin.right);
+  const plotHeight = Math.max(1, height - margin.top - margin.bottom);
+  const candidates = support.capped;
+  const retainedIds = new Set(support.retained.map(candidate => candidate.tokenId));
+  const minimumLogit = Math.min(-1, Math.floor(Math.min(...candidates.map(candidate => candidate.relativeLogit))));
+  const x = rank => margin.left + (rank / Math.max(1, support.cap - 1)) * plotWidth;
+  const y = logit => margin.top + ((0 - logit) / (0 - minimumLogit)) * plotHeight;
+
+  context.font = "10px ui-sans-serif, system-ui";
+  context.lineWidth = 1;
+  context.textBaseline = "middle";
+  for (let logit = 0; logit >= minimumLogit; --logit) {
+    const axisY = y(logit);
+    context.strokeStyle = logit === 0 || logit === minimumLogit ? "#45515e" : "#27313a";
+    context.beginPath();
+    context.moveTo(margin.left, axisY);
+    context.lineTo(width - margin.right, axisY);
+    context.stroke();
+    context.fillStyle = "#7f8d9a";
+    context.fillText(logit === 0 ? "max" : `${logit}`, 7, axisY);
+  }
+
+  const gaps = candidates.slice(1).map((candidate, index) => ({
+    rank: index,
+    gap: candidates[index].relativeLogit - candidate.relativeLogit
+  })).sort((left, right) => right.gap - left.gap);
+  const importantGaps = gaps.slice(0, 3);
+  for (const gap of importantGaps) {
+    context.strokeStyle = gap === importantGaps[0] ? "#b779ff" : "#66518a";
+    context.globalAlpha = gap === importantGaps[0] ? 0.9 : 0.55;
+    context.beginPath();
+    context.moveTo(x(gap.rank + 0.5), margin.top);
+    context.lineTo(x(gap.rank + 0.5), height - margin.bottom);
+    context.stroke();
+  }
+  context.globalAlpha = 1;
+
+  context.lineJoin = "round";
+  context.lineWidth = 1.8;
+  context.strokeStyle = "#43d0c1";
+  context.beginPath();
+  candidates.forEach((candidate, index) => {
+    const px = x(index);
+    const py = y(Math.max(minimumLogit, candidate.relativeLogit));
+    if (index === 0) context.moveTo(px, py); else context.lineTo(px, py);
+  });
+  context.stroke();
+
+  candidates.forEach((candidate, index) => {
+    context.fillStyle = retainedIds.has(candidate.tokenId) ? "#ff9b42" : "#56616d";
+    context.beginPath();
+    context.arc(x(index), y(Math.max(minimumLogit, candidate.relativeLogit)), retainedIds.has(candidate.tokenId) ? 2.2 : 1.5, 0,
+      Math.PI * 2);
+    context.fill();
+  });
+
+  context.fillStyle = "#7f8d9a";
+  context.textBaseline = "alphabetic";
+  context.textAlign = "left";
+  context.fillText("Top 1", margin.left, height - 7);
+  context.textAlign = "right";
+  context.fillText(`Cap ${support.cap}`, width - margin.right, height - 7);
+  context.textAlign = "left";
+
+  const largestGap = importantGaps[0];
+  elements.workbenchLandscapeCaption.textContent = largestGap ?
+    `Largest local gap ${largestGap.gap.toFixed(2)} after rank ${largestGap.rank + 1}` : "No local gap";
+}
+
+function workbenchProbabilityDomain(results, scale) {
+  const values = results.flatMap(result => result.probabilities).filter(value => value > 0);
+  const maximum = Math.max(...values, 1e-12);
+  if (scale === "linear") return { minimum: 0, maximum };
+  const maximumExponent = Math.min(0, Math.ceil(Math.log10(maximum)));
+  const minimumExponent = Math.max(maximumExponent - 6, Math.floor(Math.log10(Math.min(...values, maximum))));
+  return { minimum: Math.pow(10, minimumExponent), maximum: Math.pow(10, maximumExponent) };
+}
+
+function drawWorkbenchProfile(result, support, domain, scale) {
+  const canvas = elements[result.canvas];
+  const { context, width, height } = workbenchCanvasContext(canvas);
+  const margin = { left: 47, right: 12, top: 12, bottom: 25 };
+  const plotWidth = Math.max(1, width - margin.left - margin.right);
+  const plotHeight = Math.max(1, height - margin.top - margin.bottom);
+  const maximumRank = Math.max(1, support.cap - 1);
+  const x = rank => margin.left + (rank / maximumRank) * plotWidth;
+  const y = probability => {
+    if (scale === "linear")
+      return margin.top + (1 - probability / Math.max(domain.maximum, 1e-12)) * plotHeight;
+    const lower = Math.log10(domain.minimum);
+    const upper = Math.log10(domain.maximum);
+    return margin.top + ((upper - Math.log10(Math.max(domain.minimum, probability))) / Math.max(1e-9, upper - lower)) * plotHeight;
+  };
+
+  context.font = "10px ui-sans-serif, system-ui";
+  context.lineWidth = 1;
+  context.textBaseline = "middle";
+  const tickCount = scale === "linear" ? 4 : Math.max(2, Math.round(Math.log10(domain.maximum / domain.minimum)));
+  for (let tick = 0; tick <= tickCount; ++tick) {
+    const probability = scale === "linear" ? domain.maximum * tick / tickCount :
+      domain.minimum * Math.pow(domain.maximum / domain.minimum, tick / tickCount);
+    const axisY = y(probability);
+    context.strokeStyle = tick === 0 || tick === tickCount ? "#45515e" : "#27313a";
+    context.beginPath();
+    context.moveTo(margin.left, axisY);
+    context.lineTo(width - margin.right, axisY);
+    context.stroke();
+    context.fillStyle = "#7f8d9a";
+    const percent = probability * 100;
+    context.fillText(percent >= 1 ? `${percent.toFixed(0)}%` : `${percent.toPrecision(1)}%`, 5, axisY);
+  }
+
+  const selected = result.selection.index;
+  const selectedRank = support.retained[selected]?.rank ?? 0;
+  context.fillStyle = "rgba(183, 121, 255, 0.12)";
+  const selectionWidth = Math.max(5, plotWidth / Math.max(1, support.cap));
+  context.fillRect(x(selectedRank) - selectionWidth * 0.5, margin.top, selectionWidth, plotHeight);
+
+  context.strokeStyle = result.color;
+  context.lineWidth = 1.9;
+  context.lineJoin = "round";
+  context.beginPath();
+  result.probabilities.forEach((probability, index) => {
+    const px = x(support.retained[index].rank);
+    const py = y(probability);
+    if (index === 0) context.moveTo(px, py); else context.lineTo(px, py);
+  });
+  context.stroke();
+
+  result.probabilities.forEach((probability, index) => {
+    const isSelected = index === selected;
+    context.fillStyle = isSelected ? "#e6edf3" : result.color;
+    context.beginPath();
+    context.arc(x(support.retained[index].rank), y(probability), isSelected ? 3.5 : 1.8, 0, Math.PI * 2);
+    context.fill();
+    if (isSelected) {
+      context.strokeStyle = "#b779ff";
+      context.lineWidth = 1.5;
+      context.stroke();
+    }
+  });
+
+  context.fillStyle = "#7f8d9a";
+  context.textBaseline = "alphabetic";
+  context.textAlign = "left";
+  context.fillText("Top 1", margin.left, height - 7);
+  context.textAlign = "right";
+  context.fillText(`Cap ${support.cap}`, width - margin.right, height - 7);
+  context.textAlign = "left";
+
+  const selectedProbability = result.probabilities[selected] || 0;
+  const selectedText = result.selectedCandidate?.text || `rank ${selectedRank + 1}`;
+  elements[result.caption].textContent =
+    `${Math.exp(result.entropy).toFixed(1)} effective choices · draw → rank ${selectedRank + 1} ${JSON.stringify(selectedText)} · ` +
+    `${percentage(selectedProbability)} in [${result.selection.start.toFixed(3)}, ${result.selection.end.toFixed(3)})`;
+}
+
+function updateWorkbenchLabels() {
+  const diversity = Number(elements.workbenchDiversity.value) / 100;
+  const topP = Number(elements.workbenchTopP.value);
+  elements.workbenchDiversityValue.value =
+    `${elements.workbenchDiversity.value}% · ${diversityMode(diversity)}`;
+  elements.workbenchCapValue.value = elements.workbenchCap.value;
+  elements.workbenchMinPValue.value = `${Number(elements.workbenchMinP.value).toFixed(1)}%`;
+  elements.workbenchTopPValue.value = topP >= 100 ? "Off" : `${topP}% mass`;
+  elements.workbenchDrawValue.value = Number(elements.workbenchDraw.value).toFixed(3);
+}
+
+function drawWorkbench() {
+  updateWorkbenchLabels();
+  const landscape = activeWorkbenchLandscape();
+  const support = workbenchSupport(landscape);
+  const diversity = Number(elements.workbenchDiversity.value) / 100;
+  const draw = Number(elements.workbenchDraw.value);
+  const results = workbenchProfileResults(support, diversity, draw);
+  const scale = elements.workbenchScale.value;
+  const domain = workbenchProbabilityDomain(results, scale);
+
+  drawWorkbenchLandscape(landscape, support);
+  results.forEach(result => drawWorkbenchProfile(result, support, domain, scale));
+
+  const removedByCap = Math.max(0, landscape.finiteCandidateCount - support.cap);
+  const removedByRules = Math.max(0, support.cap - support.retained.length);
+  elements.workbenchSupportCaption.textContent =
+    `${support.retained.length} retained · ${removedByCap.toLocaleString()} beyond cap · ` +
+    `${removedByRules} removed by Min-P / Top-P`;
+
+  if (landscape.synthetic) {
+    const liveReady = liveLogitLandscape ? " Last model decision is ready in the landscape menu." : "";
+    elements.workbenchSourceNote.textContent = `${syntheticLandscapeNotes[elements.workbenchSource.value]}${liveReady}`;
+  } else {
+    const mass = percentage(landscape.capturedProbabilityMass);
+    elements.workbenchSourceNote.textContent =
+      `Response step ${landscape.samplingStep}: actual token ${JSON.stringify(landscape.selectedToken)}. ` +
+      `${landscape.candidates.length} captured candidates contain ${mass} of full-vocabulary probability mass. ` +
+      "The shared draw is a proxy inside that token's original interval; the exact RNG value is not exposed.";
+  }
+}
+
+function setLiveWorkbenchDefaults() {
+  if (!liveLogitLandscape) return;
+  const settings = liveLogitLandscape.samplingSettings;
+  elements.workbenchCap.max = String(liveLogitLandscape.candidates.length);
+  elements.workbenchCap.value = String(Math.min(settings.candidateCap, liveLogitLandscape.candidates.length));
+  elements.workbenchDiversity.value = String(Math.round(settings.diversity * 100));
+  elements.workbenchMinP.value = String(Math.min(20, settings.minimumRelativeProbability * 100));
+  elements.workbenchTopP.value = "100";
+
+  const support = workbenchSupport(liveLogitLandscape);
+  const profile = workbenchProfileResults(support, settings.diversity, 0.5)
+    .find(result => result.id === settings.profile);
+  const selectedIndex = support.retained.findIndex(candidate => candidate.tokenId === liveLogitLandscape.selectedTokenId);
+  if (profile && selectedIndex >= 0) {
+    const start = profile.probabilities.slice(0, selectedIndex).reduce((sum, value) => sum + value, 0);
+    const end = start + profile.probabilities[selectedIndex];
+    elements.workbenchDraw.value = String(Math.min(0.999, (start + end) * 0.5));
+  }
+}
+
+async function loadLiveLogitLandscape(next) {
+  if (next.generating || !next.representativeSampling || next.samplingStep <= 0) return;
+  const key = `${next.samplingStep}:${next.selectedToken}`;
+  if (requestedLandscapeKey === key) return;
+  requestedLandscapeKey = key;
+  try {
+    const landscape = await request("/api/landscape");
+    if (!landscape.available || !Array.isArray(landscape.candidates) || !landscape.candidates.length) return;
+    liveLogitLandscape = landscape;
+    const liveOption = elements.workbenchSource.querySelector('option[value="live"]');
+    liveOption.disabled = false;
+    liveOption.textContent = `Last model decision · step ${landscape.samplingStep}`;
+    if (elements.workbenchSource.value === "live") {
+      setLiveWorkbenchDefaults();
+      drawWorkbench();
+    } else {
+      drawWorkbench();
+    }
+  } catch (error) {
+    requestedLandscapeKey = null;
+    elements.error.textContent = `Sampling landscape could not be loaded: ${error.message}`;
+  }
 }
 
 function currentSettings() {
@@ -348,6 +844,7 @@ function effectiveChoiceCount(entropy) {
 }
 
 function applySnapshot(next) {
+  if (next.generating && !snapshot?.generating) requestedLandscapeKey = null;
   snapshot = next;
   if (!controlsInitialized) initializeControls(next.settings);
   if (staleSamplingStep !== null && next.samplingStep > 0 && next.samplingStep !== staleSamplingStep) staleSamplingStep = null;
@@ -375,6 +872,7 @@ function applySnapshot(next) {
   elements.evalStart.disabled = evaluationRunning || distributionRunning || !next.modelLoaded || next.generating;
   elements.distStart.disabled = distributionRunning || evaluationRunning || !next.modelLoaded || next.generating;
   drawPlot();
+  loadLiveLogitLandscape(next);
 }
 
 async function poll() {
@@ -2099,6 +2597,19 @@ elements.diversity.addEventListener("input", queueSettings);
 elements.candidateCap.addEventListener("change", queueSettings);
 elements.minimumRelativeProbability.addEventListener("change", queueSettings);
 
+elements.workbenchSource.addEventListener("change", () => {
+  const landscape = activeWorkbenchLandscape();
+  elements.workbenchCap.max = String(landscape.candidates.length);
+  if (elements.workbenchSource.value === "live") setLiveWorkbenchDefaults();
+  else elements.workbenchCap.value = String(Math.min(64, landscape.candidates.length));
+  drawWorkbench();
+});
+for (const element of [
+  elements.workbenchDiversity, elements.workbenchCap, elements.workbenchMinP, elements.workbenchTopP,
+  elements.workbenchDraw
+]) element.addEventListener("input", drawWorkbench);
+elements.workbenchScale.addEventListener("change", drawWorkbench);
+
 elements.send.addEventListener("click", sendMessage);
 elements.stop.addEventListener("click", () => request("/api/stop", { method: "POST", body: "{}" }).catch(error => elements.error.textContent = error.message));
 elements.clear.addEventListener("click", () => request("/api/clear", { method: "POST", body: "{}" }).catch(error => elements.error.textContent = error.message));
@@ -2139,6 +2650,7 @@ elements.distExportJson.addEventListener("click", exportDistributionJson);
 elements.distExportCsv.addEventListener("click", exportDistributionCsv);
 window.addEventListener("resize", () => {
   drawPlot();
+  drawWorkbench();
   if (activeDistributionRun?.probes.length)
     drawDistributionCharts(activeDistributionRun, distributionAggregates(activeDistributionRun));
 });
@@ -2149,5 +2661,6 @@ showNextUnjudgedTrial();
 initializeDistributionLab();
 updateControlLabels();
 drawPlot();
+drawWorkbench();
 document.documentElement.dataset.logitScopeReady = "true";
 poll();

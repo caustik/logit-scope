@@ -328,6 +328,12 @@ class Engine::Impl
         return preview_snapshot_;
     }
 
+    LogitLandscape logit_landscape() const
+    {
+        const std::lock_guard lock(landscape_mutex_);
+        return logit_landscape_;
+    }
+
     EvaluationResult evaluation_result() const
     {
         const std::lock_guard lock(evaluation_mutex_);
@@ -356,8 +362,13 @@ class Engine::Impl
     struct PendingSamplingData
     {
         bool valid = false;
+        int sampling_step = 0;
+        int selected_token_id = -1;
         std::string selected_token;
         ShapeSettings settings;
+        std::size_t finite_candidate_count = 0;
+        double captured_probability_mass = 0.0;
+        std::vector<llama_token_data> source_candidates;
         std::size_t candidate_count = 0;
         std::size_t probability_count = 0;
         std::array<std::size_t, display_rank_count> probability_ranks{};
@@ -390,6 +401,9 @@ class Engine::Impl
 
     struct CandidateTransformDiagnostics
     {
+        std::size_t finite_candidate_count = 0;
+        double capped_probability_mass = 0.0;
+        std::vector<llama_token_data> source_candidates;
         std::vector<int> retained_token_ids;
         std::vector<double> retained_raw_probabilities;
         std::vector<double> shaped_probabilities;
@@ -439,6 +453,10 @@ class Engine::Impl
                     }
                     pending_sampling_ = {};
                     representative_sampling_ = {};
+                    {
+                        const std::lock_guard landscape_lock(landscape_mutex_);
+                        logit_landscape_ = {};
+                    }
                     messages_.clear();
                     current_response_.clear();
                     previous_formatted_length_ = 0;
@@ -1088,6 +1106,15 @@ class Engine::Impl
 
     void process_message(const std::string& message, const std::string& assistant_prefix = {})
     {
+        {
+            const std::lock_guard offline_job_lock(offline_job_mutex_);
+            if (offline_job_type_ == OfflineJobType::none)
+            {
+                const std::lock_guard landscape_lock(landscape_mutex_);
+                logit_landscape_ = {};
+            }
+        }
+
         messages_.push_back({"user", message});
 
         std::string formatted;
@@ -1355,6 +1382,11 @@ class Engine::Impl
             selected_candidates[rank] = candidates->data[ordered_indices[rank]];
             retained_ranks[rank] = static_cast<int>(rank);
         }
+        if (diagnostics != nullptr)
+        {
+            diagnostics->finite_candidate_count = ordered_indices.size();
+            diagnostics->source_candidates = selected_candidates;
+        }
 
         if (settings.minimum_relative_probability > 0.0f)
         {
@@ -1434,6 +1466,12 @@ class Engine::Impl
         }
         double selected_weight = 0.0;
         for (const auto logit : raw_logits) selected_weight += std::exp(static_cast<double>(logit - maximum_logit));
+        double capped_weight = 0.0;
+        if (diagnostics != nullptr)
+        {
+            for (const auto& candidate : diagnostics->source_candidates)
+                capped_weight += std::exp(static_cast<double>(candidate.logit - maximum_logit));
+        }
 
         if (diagnostics != nullptr)
         {
@@ -1448,6 +1486,7 @@ class Engine::Impl
                 diagnostics->shaped_probabilities.push_back(shaped_probabilities[rank]);
             }
             diagnostics->retained_probability_mass = total_weight > 0.0 ? selected_weight / total_weight : 0.0;
+            diagnostics->capped_probability_mass = total_weight > 0.0 ? capped_weight / total_weight : 0.0;
             diagnostics->raw_metrics = raw_metrics;
             diagnostics->target_metrics = target_metrics;
             diagnostics->shaped_metrics = shaped_metrics;
@@ -1470,6 +1509,9 @@ class Engine::Impl
         pending_sampling_ = {};
         pending_sampling_.valid = true;
         pending_sampling_.settings = settings;
+        pending_sampling_.finite_candidate_count = diagnostics.finite_candidate_count;
+        pending_sampling_.captured_probability_mass = diagnostics.capped_probability_mass;
+        pending_sampling_.source_candidates = std::move(diagnostics.source_candidates);
         pending_sampling_.candidate_count = diagnostics.retained_token_ids.size();
         pending_sampling_.probability_count = std::min(display_rank_count, pending_sampling_.candidate_count);
         auto previous_rank = std::size_t{};
@@ -1500,7 +1542,10 @@ class Engine::Impl
     {
         if (!pending_sampling_.valid) return;
 
+        pending_sampling_.selected_token_id = selected_token;
         pending_sampling_.selected_token = sanitize_utf8(token_to_piece(vocab_, selected_token));
+        const std::lock_guard lock(snapshot_mutex_);
+        pending_sampling_.sampling_step = ++snapshot_.sampling_step;
         const auto settings_match =
             representative_sampling_.valid && pending_sampling_.settings.profile == representative_sampling_.settings.profile &&
             pending_sampling_.settings.diversity == representative_sampling_.settings.diversity &&
@@ -1511,8 +1556,6 @@ class Engine::Impl
         if (!settings_match || pending_sampling_.raw_entropy > representative_sampling_.raw_entropy)
             representative_sampling_ = pending_sampling_;
 
-        const std::lock_guard lock(snapshot_mutex_);
-        ++snapshot_.sampling_step;
         snapshot_.representative_sampling = false;
         copy_sampling_data(pending_sampling_, snapshot_);
         pending_sampling_ = {};
@@ -1539,9 +1582,41 @@ class Engine::Impl
     {
         if (!representative_sampling_.valid) return;
 
-        const std::lock_guard lock(snapshot_mutex_);
-        snapshot_.representative_sampling = true;
-        copy_sampling_data(representative_sampling_, snapshot_);
+        {
+            const std::lock_guard lock(snapshot_mutex_);
+            snapshot_.representative_sampling = true;
+            copy_sampling_data(representative_sampling_, snapshot_);
+        }
+
+        {
+            const std::lock_guard offline_job_lock(offline_job_mutex_);
+            if (offline_job_type_ != OfflineJobType::none) return;
+        }
+
+        LogitLandscape landscape;
+        landscape.available = !representative_sampling_.source_candidates.empty();
+        landscape.sampling_step = representative_sampling_.sampling_step;
+        landscape.selected_token_id = representative_sampling_.selected_token_id;
+        landscape.selected_token = representative_sampling_.selected_token;
+        landscape.sampling_settings = representative_sampling_.settings;
+        landscape.finite_candidate_count = representative_sampling_.finite_candidate_count;
+        landscape.captured_probability_mass = representative_sampling_.captured_probability_mass;
+        landscape.candidates.reserve(representative_sampling_.source_candidates.size());
+        if (!representative_sampling_.source_candidates.empty())
+        {
+            const auto maximum_logit = representative_sampling_.source_candidates.front().logit;
+            for (std::size_t rank = 0; rank < representative_sampling_.source_candidates.size(); ++rank)
+            {
+                const auto& candidate = representative_sampling_.source_candidates[rank];
+                landscape.candidates.push_back(
+                    {candidate.id, token_display_text(candidate.id), static_cast<int>(rank), candidate.logit - maximum_logit,
+                     representative_sampling_.settings.protect_control_tokens && vocab_ != nullptr &&
+                         (llama_vocab_is_control(vocab_, candidate.id) || llama_vocab_is_eog(vocab_, candidate.id))});
+            }
+        }
+
+        const std::lock_guard landscape_lock(landscape_mutex_);
+        logit_landscape_ = std::move(landscape);
     }
 
     void publish_transcript(bool generating)
@@ -1628,6 +1703,8 @@ class Engine::Impl
     std::atomic<float> settings_minimum_relative_probability_{ShapeSettings{}.minimum_relative_probability};
     std::atomic<std::uint32_t> settings_seed_{ShapeSettings{}.seed};
     std::atomic<bool> settings_protect_control_{ShapeSettings{}.protect_control_tokens};
+    mutable std::mutex landscape_mutex_;
+    LogitLandscape logit_landscape_;
 
     std::atomic<bool> started_{false};
     std::atomic<bool> stop_requested_{false};
@@ -1700,6 +1777,8 @@ void Engine::set_shape_settings(const ShapeSettings& settings) { impl_->set_shap
 SamplingSnapshot Engine::snapshot() const { return impl_->snapshot(); }
 
 SamplingSnapshot Engine::preview_snapshot(const ShapeSettings& settings) const { return impl_->preview_snapshot(settings); }
+
+LogitLandscape Engine::logit_landscape() const { return impl_->logit_landscape(); }
 
 EvaluationResult Engine::evaluation_result() const { return impl_->evaluation_result(); }
 

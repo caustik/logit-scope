@@ -46,6 +46,27 @@ struct SamplingSnapshot
     float jensen_shannon_divergence = 0.0f;
 };
 
+struct LogitLandscapeCandidate
+{
+    int token_id = -1;
+    std::string text;
+    int rank = -1;
+    float relative_logit = 0.0f;
+    bool protected_token = false;
+};
+
+struct LogitLandscape
+{
+    bool available = false;
+    int sampling_step = 0;
+    int selected_token_id = -1;
+    std::string selected_token;
+    ShapeSettings sampling_settings;
+    std::size_t finite_candidate_count = 0;
+    double captured_probability_mass = 0.0;
+    std::vector<LogitLandscapeCandidate> candidates;
+};
+
 struct EvaluationResult
 {
     std::uint64_t id = 0;
@@ -194,6 +215,7 @@ class Engine
     void set_shape_settings(const ShapeSettings& settings);
     SamplingSnapshot snapshot() const;
     SamplingSnapshot preview_snapshot(const ShapeSettings& settings) const;
+    LogitLandscape logit_landscape() const;
     EvaluationResult evaluation_result() const;
     DistributionProbeResult distribution_result() const;
 

@@ -70,6 +70,118 @@
       <p class="control-note">Across the range, the percentage scales effective alternatives. Min-P removes low-confidence noise before rank shaping.</p>
     </section>
 
+    <details class="sampling-workbench panel" open>
+      <summary>
+        <span>
+          <strong>Sampling Geometry Lab</strong>
+          <small>Hold one logit landscape and random draw still; compare what every rank profile changes</small>
+        </span>
+        <span class="workbench-badge">Interactive sandbox</span>
+      </summary>
+
+      <div class="workbench-body">
+        <div class="workbench-intro">
+          <p>The charts share one scale and one counterfactual draw. Every shaped profile targets the same effective-choice count, so differences expose rank-gap geometry rather than a hidden temperature change.</p>
+          <p>Cap, Min-P, and Top-P define the support first. The real-token source appears after a response and replays the raw candidates from its most uncertain sampling step.</p>
+        </div>
+
+        <section class="workbench-controls" aria-label="Geometry lab controls">
+          <label>
+            <span>Logit landscape</span>
+            <select id="workbenchSource">
+              <option value="broad-shoulder" selected>Broad shoulder</option>
+              <option value="confident-cliff">Confident cliff</option>
+              <option value="long-tail">Long tail</option>
+              <option value="two-shelves">Two shelves</option>
+              <option value="live" disabled>Last model decision</option>
+            </select>
+          </label>
+
+          <label class="slider-control">
+            <span>Diversity <output id="workbenchDiversityValue">150% · 1.50× alternatives</output></span>
+            <input id="workbenchDiversity" type="range" min="0" max="200" step="1" value="150">
+          </label>
+
+          <label class="slider-control">
+            <span>Candidate cap <output id="workbenchCapValue">64</output></span>
+            <input id="workbenchCap" type="range" min="2" max="96" step="1" value="64">
+          </label>
+
+          <label class="slider-control">
+            <span>Min-P <output id="workbenchMinPValue">1.0%</output></span>
+            <input id="workbenchMinP" type="range" min="0" max="20" step="0.5" value="1">
+          </label>
+
+          <label class="slider-control">
+            <span>Top-P <output id="workbenchTopPValue">Off</output></span>
+            <input id="workbenchTopP" type="range" min="50" max="100" step="1" value="100">
+          </label>
+
+          <label class="slider-control">
+            <span>Shared what-if draw <output id="workbenchDrawValue">0.420</output></span>
+            <input id="workbenchDraw" type="range" min="0" max="0.999" step="0.001" value="0.42">
+          </label>
+
+          <label>
+            <span>Probability scale</span>
+            <select id="workbenchScale">
+              <option value="log" selected>Logarithmic</option>
+              <option value="linear">Linear</option>
+            </select>
+          </label>
+        </section>
+
+        <p id="workbenchSourceNote" class="workbench-source-note"></p>
+
+        <section class="workbench-landscape">
+          <div>
+            <h2>Ranked logit landscape</h2>
+            <p id="workbenchLandscapeCaption"></p>
+          </div>
+          <canvas id="workbenchLandscape" aria-label="Relative logits by candidate rank with the largest local gaps marked"></canvas>
+        </section>
+
+        <section class="workbench-profile-section">
+          <div class="workbench-profile-heading">
+            <h2>Same support, entropy target, and draw</h2>
+            <p id="workbenchSupportCaption"></p>
+          </div>
+          <div id="workbenchProfiles" class="workbench-profile-grid">
+            <article data-profile="none">
+              <h3>Retained raw</h3>
+              <canvas id="workbenchRaw" aria-label="Raw retained sampling probability by candidate rank"></canvas>
+              <p id="workbenchRawCaption"></p>
+            </article>
+            <article data-profile="temperature">
+              <h3>Temperature</h3>
+              <canvas id="workbenchTemperature" aria-label="Entropy-matched temperature probability by candidate rank"></canvas>
+              <p id="workbenchTemperatureCaption"></p>
+            </article>
+            <article data-profile="exponential">
+              <h3>Exponential</h3>
+              <canvas id="workbenchExponential" aria-label="Exponential rank-profile probability by candidate rank"></canvas>
+              <p id="workbenchExponentialCaption"></p>
+            </article>
+            <article data-profile="soliton">
+              <h3>Soliton</h3>
+              <canvas id="workbenchSoliton" aria-label="Soliton rank-profile probability by candidate rank"></canvas>
+              <p id="workbenchSolitonCaption"></p>
+            </article>
+            <article data-profile="power">
+              <h3>Power</h3>
+              <canvas id="workbenchPower" aria-label="Power rank-profile probability by candidate rank"></canvas>
+              <p id="workbenchPowerCaption"></p>
+            </article>
+            <article data-profile="half-normal">
+              <h3>Half-normal</h3>
+              <canvas id="workbenchHalfNormal" aria-label="Half-normal rank-profile probability by candidate rank"></canvas>
+              <p id="workbenchHalfNormalCaption"></p>
+            </article>
+          </div>
+        </section>
+      </div>
+    </details>
+
     <section class="scope panel">
       <div class="scope-heading">
         <div>
